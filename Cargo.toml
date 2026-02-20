@@ -1,0 +1,73 @@
+[package]
+name = "soas-core"
+version = "0.1.0"
+edition = "2024"
+description = "SOAS - Sistema Inteligente de Búsqueda de Archivos"
+license = "MIT"
+
+[lib]
+name = "soas_core"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Database
+rusqlite = { version = "0.31", features = ["bundled", "blob"] }
+
+# HTTP client (Ollama API)
+reqwest = { version = "0.12", features = ["json"] }
+
+# File system
+walkdir = "2"
+notify = { version = "6", features = ["serde"] }
+mime_guess = "2"
+
+# Content extraction
+pdf-extract = "0.7"
+zip = "2"
+quick-xml = "0.36"
+csv = "1"
+encoding_rs = "0.8"
+
+# Hashing
+sha2 = "0.10"
+
+# DateTime
+chrono = { version = "0.4", features = ["serde"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# UUID
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Base64 for image encoding
+base64 = "0.22"
+
+# Image resizing for faster OCR inference
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "bmp", "tiff"] }
+
+# Ordered float for vector operations
+ordered-float = "4"
+
+# Bincode for vector serialization
+bincode = "1"
+
+[[bin]]
+name = "soas-cli"
+path = "src/bin/cli.rs"
+
+[dev-dependencies]
+tempfile = "3"
+tokio-test = "0.4"
