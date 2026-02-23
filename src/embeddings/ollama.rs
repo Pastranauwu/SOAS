@@ -1,5 +1,6 @@
 use crate::config::OllamaConfig;
 use crate::error::{Result, SoasError};
+use regex::Regex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,6 +17,46 @@ fn safe_truncate(s: &str, max_bytes: usize) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+/// Elimina tokens de pensamiento de modelos Qwen3 usando regex.
+/// Qwen3 genera `<think>...razonamiento...</think>` antes de la respuesta.
+/// Usamos regex para capturar TODO el bloque de thinking de forma robusta,
+/// incluyendo saltos de línea y caracteres especiales.
+fn strip_thinking_tokens(text: &str) -> String {
+    let s = text.trim();
+    if s.is_empty() {
+        return String::new();
+    }
+
+    // Regex: captura <think>CUALQUIER COSA</think> (lazy, con dotall para \n)
+    // (?s) activa dot-matches-newline
+    let re = Regex::new(r"(?s)<think>.*?</think>").unwrap();
+
+    if re.is_match(s) {
+        let cleaned = re.replace_all(s, "").trim().to_string();
+        if cleaned.is_empty() {
+            // Pensó pero la respuesta real está vacía
+            warn!(
+                "strip_thinking: regex eliminó thinking ({} chars) pero no quedó respuesta",
+                s.len()
+            );
+        }
+        return cleaned;
+    }
+
+    // Caso truncado: empieza con <think> pero nunca cierra
+    if s.starts_with("<think>") {
+        warn!(
+            "strip_thinking: pensamiento truncado ({} chars), num_predict insuficiente. Inicio: {:?}",
+            s.len(),
+            &s[..s.len().min(150)]
+        );
+        return String::new();
+    }
+
+    // Sin thinking tokens, devolver tal cual
+    s.to_string()
 }
 
 fn normalize_filename_title(filename: &str) -> String {
@@ -70,7 +111,7 @@ pub struct OllamaClient {
     /// Circuit breaker: se activa cuando vision_model (glm-ocr) falla con error de red.
     /// Evita perder ~5 min de timeout por cada imagen restante.
     vision_model_failed: AtomicBool,
-    /// Circuit breaker para description_model (qwen3-vl).
+    /// Circuit breaker para description_model de visión.
     /// Si falla 2 veces consecutivas con error de red/timeout, se desactiva
     /// para no bloquear el pipeline con imágenes que jamás se procesarán.
     description_model_failed: AtomicBool,
@@ -102,6 +143,8 @@ struct ChatRequest {
     messages: Vec<ChatMessage>,
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    think: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     format: Option<String>,
     /// Opciones de runtime para Ollama (num_ctx, temperature, etc.)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -129,13 +172,261 @@ struct ChatResponse {
 #[derive(Deserialize)]
 struct ChatResponseMessage {
     content: String,
+    #[serde(default)]
+    thinking: Option<String>,
+}
+
+fn extract_answer_from_thinking(thinking: &str) -> String {
+    let t = thinking.trim();
+    if t.is_empty() {
+        return String::new();
+    }
+
+    if let Ok(quoted_re) = Regex::new(r#"(?s)\"([^\"\n]{30,600})\""#) {
+        if let Some(captures) = quoted_re.captures_iter(t).last() {
+            if let Some(m) = captures.get(1) {
+                let candidate = m.as_str().trim();
+                if !candidate.is_empty() {
+                    return candidate.to_string();
+                }
+            }
+        }
+    }
+
+    if let Ok(two_sentences_es) = Regex::new(
+        r"(?s)([A-ZÁÉÍÓÚÑ][^\n]{25,260}[\.!?]\s+[A-ZÁÉÍÓÚÑ][^\n]{25,260}[\.!?])",
+    ) {
+        if let Some(captures) = two_sentences_es.captures_iter(t).last() {
+            if let Some(m) = captures.get(1) {
+                let candidate = m.as_str().trim();
+                if !candidate.is_empty() {
+                    return candidate.to_string();
+                }
+            }
+        }
+    }
+
+    for marker in ["Possible translation:", "Final answer:", "Respuesta final:"] {
+        if let Some(pos) = t.rfind(marker) {
+            let after = t[pos + marker.len()..].trim().trim_matches('"').trim();
+            if after.len() >= 20 {
+                return after.to_string();
+            }
+        }
+    }
+
+    let lines: Vec<&str> = t
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    let invalid_markers = [
+        "documento|foto|captura|gráfico|otro",
+        "si/no + resumen corto",
+        "texto visible: si/no",
+        "tema: frase corta",
+        "is a template",
+        "placeholder",
+        "fill in",
+        "formato esperado:",
+    ];
+
+    for line in lines.iter().rev() {
+        let lower = line.to_lowercase();
+        
+        // Skip template echoes
+        if invalid_markers.iter().any(|m| lower.contains(m)) {
+            continue;
+        }
+        
+        let looks_like_meta = lower.starts_with("wait")
+            || lower.starts_with("let me")
+            || lower.starts_with("i should")
+            || lower.starts_with("i need")
+            || lower.starts_with("the user")
+            || lower.starts_with("maybe")
+            || lower.starts_with("so:")
+            || lower.starts_with("hmm")
+            || lower.starts_with("ok,")
+            || lower.starts_with("first,")
+            || lower.starts_with("now,");
+
+        if !looks_like_meta && line.len() >= 30 {
+            // Additional check: valid sentence structure?
+            // Should not end with colon unless it's a list header we want
+            if line.ends_with(':') && line.len() < 50 {
+                continue;
+            }
+            return (*line).to_string();
+        }
+    }
+
+    String::new()
+}
+
+fn extract_visible_response(message: &ChatResponseMessage) -> String {
+    let content = strip_thinking_tokens(&message.content);
+    if !content.trim().is_empty() {
+        return content;
+    }
+
+    if let Some(thinking) = &message.thinking {
+        let recovered = extract_answer_from_thinking(thinking);
+        if !recovered.is_empty() {
+            warn!(
+                "Respuesta en content vacía; recuperando texto desde campo thinking ({} chars)",
+                thinking.len()
+            );
+            return recovered;
+        }
+    }
+
+    String::new()
+}
+
+fn vision_debug_enabled() -> bool {
+    matches!(
+        std::env::var("SOAS_VISION_DEBUG"),
+        Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
+    )
+}
+
+fn looks_like_useful_vision_text(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.len() < 30 {
+        return false;
+    }
+
+    let lower = trimmed.to_lowercase();
+
+    // Eco de plantilla: no aporta semántica real.
+    let template_markers = [
+        "documento|foto|captura|gráfico|otro",
+        "si/no + resumen corto",
+        "frase corta",
+        "texto visible: si/no",
+        "tipo: documento|foto",
+    ];
+    if template_markers.iter().any(|m| lower.contains(m)) {
+        return false;
+    }
+
+    // Patrones de texto meta/residual que no describen realmente la imagen.
+    let bad_markers = [
+        "or something similar",
+        "need to check",
+        "the image has",
+        "the text visible",
+        "is right",
+        "it appears",
+        "let me",
+        "i should",
+        "i need",
+        "maybe",
+        "final answer",
+        "possible translation",
+    ];
+
+    if bad_markers.iter().any(|m| lower.contains(m)) {
+        return false;
+    }
+
+    // Formato esperado en modo rápido: Tipo / Texto visible / Tema.
+    let has_structured = lower.contains("tipo:")
+        && lower.contains("texto visible:")
+        && lower.contains("tema:");
+
+    if has_structured {
+        let mut good_fields = 0usize;
+        for line in trimmed.lines().map(|l| l.trim()).filter(|l| !l.is_empty()) {
+            let lower_line = line.to_lowercase();
+            let Some((_, payload_raw)) = line.split_once(':') else { continue; };
+            let payload = payload_raw.trim();
+            let payload_lower = payload.to_lowercase();
+
+            let is_structured_field = lower_line.starts_with("tipo:")
+                || lower_line.starts_with("texto visible:")
+                || lower_line.starts_with("tema:");
+            if !is_structured_field {
+                continue;
+            }
+
+            let payload_invalid = payload.is_empty()
+                || payload.contains('[')
+                || payload.contains(']')
+                || payload.contains('|')
+                || payload.contains('+')
+                || payload_lower.contains("si/no")
+                || payload_lower.contains("resumen corto")
+                || payload_lower.contains("frase corta")
+                || payload_lower.contains("documento|foto")
+                || payload.len() < 4;
+
+            if !payload_invalid {
+                good_fields += 1;
+            }
+        }
+
+        // Requerir al menos 2 campos útiles para aceptar estructurado.
+        if good_fields < 2 {
+            return false;
+        }
+    }
+
+    // Aceptar también descripciones libres en español con señales mínimas.
+    let has_spanish_signal = [
+        "imagen",
+        "foto",
+        "documento",
+        "texto",
+        "visible",
+        "tema",
+        "muestra",
+    ]
+    .iter()
+    .any(|w| lower.contains(w));
+
+    has_structured || has_spanish_signal
 }
 
 impl OllamaClient {
+    fn vision_runtime_options(model: &str) -> serde_json::Value {
+        let model_lower = model.to_lowercase();
+
+        if model_lower.contains("qwen3-vl") || model_lower.contains("qwen2.5-vl") {
+            return serde_json::json!({
+                "temperature": 0.1,
+                "num_ctx": 4096,
+                "num_predict": 1024
+            });
+        }
+        
+        if model_lower.contains("phi") {
+            // LLaVA-W / Phi-3 ajustes
+            // num_predict=512: el límite anterior de 256 truncaba el texto visible
+            // de documentos (credenciales, recibos). 512 da margen suficiente
+            // sin impacto notable en tiempo cuando la respuesta es corta.
+            return serde_json::json!({
+                "temperature": 0.1,
+                "num_ctx": 3072,
+                "num_predict": 512
+            });
+        }
+
+        serde_json::json!({
+            "temperature": 0.1,
+            "num_ctx": 2048,
+            "num_predict": 512
+        })
+    }
+
     fn chat_runtime_options() -> serde_json::Value {
         serde_json::json!({
             "num_ctx": 3072,
-            "num_predict": 140,
+            // 384 tokens: qwen3 gasta ~150-250 en  groundwork incluso con
+            // instrucciones de no pensar. 384 deja margen para respuesta.
+            "num_predict": 512,
             "temperature": 0.2
         })
     }
@@ -143,19 +434,21 @@ impl OllamaClient {
     fn chat_json_runtime_options() -> serde_json::Value {
         serde_json::json!({
             "num_ctx": 3072,
-            "num_predict": 320,
-            "temperature": 0.1
+            // 1024 tokens: qwen3 piensa ~200-300 tokens + JSON respuesta ~200-400.
+            // Con 512 se truncaba el JSON consistentemente.
+            "num_predict": 1024,
+            "temperature": 0.3
         })
     }
 
-    /// Opciones ultra-ligeras para búsqueda interactiva.
-    /// La query del usuario es corta (~10-30 tokens) y la respuesta JSON es mínima,
-    /// así que num_ctx=1024 y num_predict=100 son MÁS que suficientes.
+    /// Opciones para búsqueda interactiva.
+    /// Contexto pequeño porque la query es corta (~10-30 tokens).
+    /// num_predict=512: qwen3 piensa ~200 tokens + JSON respuesta ~80.
     /// temperature=0: respuestas deterministas para la misma consulta.
     fn chat_search_runtime_options() -> serde_json::Value {
         serde_json::json!({
-            "num_ctx": 1024,
-            "num_predict": 100,
+            "num_ctx": 2048,
+            "num_predict": 512,
             "temperature": 0.0
         })
     }
@@ -326,6 +619,7 @@ impl OllamaClient {
                 },
             ],
             stream: false,
+            think: Some(false),
             format: None,
             options: Some(Self::chat_runtime_options()),
             keep_alive: None,
@@ -339,7 +633,7 @@ impl OllamaClient {
         }
 
         let chat_resp: ChatResponse = resp.json().await?;
-        Ok(chat_resp.message.content)
+        Ok(extract_visible_response(&chat_resp.message))
     }
 
     /// Envía un prompt con formato JSON esperado
@@ -361,7 +655,12 @@ impl OllamaClient {
                 },
             ],
             stream: false,
-            format: Some("json".to_string()),
+            think: Some(false),
+            // NO usar format:"json" con qwen3 — la generación restringida
+            // por gramática impide <think> tags y el modelo produce respuesta vacía.
+            // Nuestro parser de 3 niveles (JSON directo → bloque extraído → fallback)
+            // maneja la extracción del JSON desde texto libre.
+            format: None,
             options: Some(Self::chat_json_runtime_options()),
             keep_alive: None,
         };
@@ -377,7 +676,7 @@ impl OllamaClient {
         }
 
         let chat_resp: ChatResponse = resp.json().await?;
-        Ok(chat_resp.message.content)
+        Ok(extract_visible_response(&chat_resp.message))
     }
 
     // ─────────────────────────────────────────
@@ -440,11 +739,13 @@ impl OllamaClient {
         }
     }
 
-    /// Describe una foto/ilustración usando el modelo de descripción (`description_model`, por defecto qwen3-vl:2b).
-    /// Se usa como fallback cuando glm-ocr no encuentra texto suficiente.
+    /// Describe una foto/ilustración usando el modelo de descripción visual.
+    /// Se usa como fallback cuando OCR no encuentra texto suficiente.
     /// Incluye circuit breaker: si falla 2 veces consecutivas, se desactiva.
     pub async fn describe_photo(&self, image_base64: &str, prompt: &str) -> Result<String> {
-        // Circuit breaker: si ya falló 2+ veces, no intentar
+        // Circuit breaker: si ya falló 3+ veces consecutivas, no intentar.
+        // Umbral de 3 (no 2) porque la primera imagen paga la carga del modelo
+        // en RAM (~10-15s en CPU) que puede causar 1-2 timeouts transitorios.
         if self.description_model_failed.load(Ordering::Relaxed) {
             return Err(SoasError::Ollama(format!(
                 "Circuit breaker activo: {} no disponible (falló {} veces)",
@@ -469,7 +770,7 @@ impl OllamaClient {
                         "Respuesta vacía de {} ({} veces consecutivas)",
                         self.config.description_model, count
                     );
-                    if count >= 3 {
+                    if count >= 4 {
                         warn!(
                             "Circuit breaker activado: {} devuelve vacío consistentemente. \
                              Se usará fallback para imágenes restantes.",
@@ -484,7 +785,7 @@ impl OllamaClient {
                 // Si es error de red/timeout, incrementar contador
                 if matches!(&e, SoasError::Network(_)) {
                     let count = self.description_fail_count.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count >= 2 {
+                    if count >= 3 {
                         warn!(
                             "Circuit breaker activado: {} falló {} veces consecutivas. \
                              Se saltarán las imágenes restantes.",
@@ -516,16 +817,13 @@ impl OllamaClient {
                 images: Some(vec![image_base64.to_string()]),
             }],
             stream: false,
+            think: Some(false),
             format: None,
-            // num_ctx=2048: suficiente para OCR/descripción de una imagen.
-            // Valores altos (16384) desperdician RAM y hacen la inferencia mucho
-            // más lenta en CPU. El input de imagen es fijo (~600 tokens para 768px)
-            // y la respuesta rara vez supera 300 tokens.
-            // num_predict=256: limita la salida para que no genere texto infinito.
-            options: Some(serde_json::json!({
-                "num_ctx": 2048,
-                "num_predict": 256
-            })),
+            // Perfil rápido por defecto para indexación de imágenes:
+            // - num_predict bajo (300) porque solo necesitamos metadata breve
+            // - temperature baja para consistencia
+            // - num_ctx moderado para evitar salidas vacías en qwen3-vl
+            options: Some(Self::vision_runtime_options(model)),
             // Mantener modelo en RAM 10 min: las imágenes se procesan agrupadas,
             // así el modelo se carga UNA vez y se reutiliza para todo el lote.
             keep_alive: Some("10m".to_string()),
@@ -549,7 +847,49 @@ impl OllamaClient {
         }
 
         let chat_resp: ChatResponse = resp.json().await?;
-        Ok(chat_resp.message.content)
+        let raw_content = &chat_resp.message.content;
+        let raw_thinking = chat_resp.message.thinking.as_deref().unwrap_or("");
+
+        if vision_debug_enabled() {
+            println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+            println!(
+                "🔬 RAW de [{}]: content={} chars | thinking={} chars",
+                model,
+                raw_content.len(),
+                raw_thinking.len()
+            );
+            println!("─── contenido ───");
+            println!("{}", &raw_content[..raw_content.len().min(800)]);
+            if !raw_thinking.is_empty() {
+                println!("─── thinking ───");
+                println!("{}", &raw_thinking[..raw_thinking.len().min(800)]);
+            }
+            println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+        }
+
+        let result = extract_visible_response(&chat_resp.message);
+
+        if result.is_empty() && !raw_content.trim().is_empty() {
+            warn!(
+                "🔬 Respuesta perdida por strip_thinking: el modelo generó {} chars \
+                 pero después de limpiar thinking quedó vacío. \
+                 Esto indica que num_predict es insuficiente para este modelo.",
+                raw_content.len()
+            );
+        }
+
+        if !result.is_empty() {
+            if !looks_like_useful_vision_text(&result) {
+                warn!(
+                    "Respuesta de visión descartada por baja calidad/meta-residual: {:?}",
+                    &result[..result.len().min(180)]
+                );
+                return Ok(String::new());
+            }
+            info!("🔬 Resultado limpio: {:?}", &result[..result.len().min(200)]);
+        }
+
+        Ok(result)
     }
 
     // ─────────────────────────────────────────
@@ -562,22 +902,23 @@ impl OllamaClient {
         &self,
         filename: &str,
         content_preview: &str,
+        folder_path: &str,
     ) -> Result<FileDescription> {
-        let system_prompt = r#"Genera SOLO JSON válido en español con:
-    - "title": título corto
-    - "description": resumen semántico (1 oración)
-    - "keywords": 4-8 palabras clave
-    - "semantic_tags": 2-4 temas
-    - "language": "es" | "en" | etc.
-    - "content_type_group": "documento" | "imagen" | "hoja_calculo" | "codigo" | "presentacion" | "comprimido" | "archivo"
-    - "suggested_name": string opcional
-    - "suggested_category": string opcional
+        let system_prompt = "Genera SOLO JSON válido en español. Sin explicaciones, sin markdown, sin texto fuera del JSON.";
 
-    No incluyas texto fuera del JSON."#;
-
+        // Incluir ruta de carpeta como contexto — ayuda al modelo a entender
+        // el dominio del archivo (ej: "Descargas/trabajo/" vs "Descargas/fotos/")
         let user_message = format!(
-            "Archivo: {}\n\nContenido (primeros caracteres):\n{}",
+            "Genera JSON con estos campos para el archivo:\n\
+             - \"title\": título corto descriptivo\n\
+             - \"description\": resumen semántico (1 oración)\n\
+             - \"keywords\": 4-8 palabras clave\n\
+             - \"semantic_tags\": 2-4 temas\n\
+             - \"language\": \"es\" | \"en\" | etc.\n\
+             - \"content_type_group\": \"documento\" | \"imagen\" | \"hoja_calculo\" | \"codigo\" | \"presentacion\" | \"comprimido\" | \"archivo\"\n\
+             \nArchivo: {}\nCarpeta: {}\n\nContenido (extracto):\n{}",
             filename,
+            folder_path,
             safe_truncate(content_preview, 500)
         );
 
@@ -595,7 +936,7 @@ impl OllamaClient {
                                 first_err,
                                 second_err
                             );
-                            debug!("Respuesta LLM raw: {}", safe_truncate(&response, 500));
+                            info!("Respuesta LLM raw ({}ch): {}", response.len(), safe_truncate(&response, 300));
                             Self::fallback_file_description(filename, content_preview)
                         }
                     }
@@ -604,7 +945,7 @@ impl OllamaClient {
                         "Respuesta describe_file sin JSON utilizable ({}). Usando fallback local.",
                         first_err
                     );
-                    debug!("Respuesta LLM raw: {}", safe_truncate(&response, 500));
+                    info!("Respuesta LLM raw ({}ch): {}", response.len(), safe_truncate(&response, 300));
                     Self::fallback_file_description(filename, content_preview)
                 }
             }
@@ -654,7 +995,9 @@ impl OllamaClient {
                 },
             ],
             stream: false,
-            format: Some("json".to_string()),
+            think: Some(false),
+            // Sin format:"json" — misma razón que chat_json().
+            format: None,
             options: Some(Self::chat_search_runtime_options()),
             keep_alive: None,
         };
@@ -670,7 +1013,7 @@ impl OllamaClient {
         }
 
         let chat_resp: ChatResponse = resp.json().await?;
-        Ok(chat_resp.message.content)
+        Ok(extract_visible_response(&chat_resp.message))
     }
 
     /// Mejora una consulta de búsqueda extrayendo keywords y tipo de archivo.
@@ -678,11 +1021,12 @@ impl OllamaClient {
     /// Prompt ultra-compacto: ~150 tokens de input vs ~600 del anterior.
     /// Genera ~50-80 tokens de output. En CPU con num_ctx=1024, tarda ~3-5s vs ~16s.
     pub async fn enhance_search_query(&self, user_query: &str) -> Result<EnhancedQuery> {
-        let system_prompt = r#"Extrae de la búsqueda de archivos un JSON con:
-- "keywords": 2-5 palabras clave para buscar en texto de archivos
-- "file_types": extensiones probables (ej: ["pdf"], ["jpg","png"], ["docx"]); vacío si no es claro
-- "hard_type_filter": true solo si pide explícitamente un tipo ("fotos", "PDFs")
-Solo JSON."#;
+        let system_prompt = "Eres un extractor de intención de búsqueda de archivos personales (documentos, fotos, PDFs). \
+                            De la consulta del usuario, extrae un JSON con:\n\
+                            - \"keywords\": 2-5 palabras/frases clave sustantivas (incluir sinónimos útiles, ej: \"INE\" → [\"INE\", \"credencial\", \"identificación\"])\n\
+                            - \"file_types\": extensiones probables (vacío si no es claro)\n\
+                            - \"hard_type_filter\": true solo si pide explícitamente un tipo de archivo\n\
+                            Solo JSON, sin explicaciones.";
 
         let response = self.chat_json_search(system_prompt, user_query).await?;
 
@@ -697,13 +1041,33 @@ Solo JSON."#;
             hard_type_filter: bool,
         }
 
-        let minimal: MinimalQuery = serde_json::from_str(&response).map_err(|e| {
-            warn!("Error parseando consulta mejorada: {}", e);
-            SoasError::Ollama(format!(
-                "Respuesta no es JSON válido: {}",
-                safe_truncate(&response, 200)
-            ))
-        })?;
+        // Parseo con fallback: directo → extraer bloque JSON → error
+        let minimal: MinimalQuery = match serde_json::from_str(&response) {
+            Ok(parsed) => parsed,
+            Err(first_err) => {
+                // qwen3 puede envolver JSON en texto/pensamiento residual
+                if let Some(json_block) = extract_json_object(&response) {
+                    match serde_json::from_str(json_block) {
+                        Ok(parsed) => parsed,
+                        Err(e2) => {
+                            warn!("Error parseando consulta mejorada (directo: {}, extraído: {}) | raw ({}ch): {}",
+                                first_err, e2, response.len(), safe_truncate(&response, 200));
+                            return Err(SoasError::Ollama(format!(
+                                "Respuesta no es JSON válido: {}",
+                                safe_truncate(&response, 200)
+                            )));
+                        }
+                    }
+                } else {
+                    warn!("Error parseando consulta mejorada: {} | raw ({}ch): {}",
+                        first_err, response.len(), safe_truncate(&response, 200));
+                    return Err(SoasError::Ollama(format!(
+                        "Respuesta no es JSON válido: {}",
+                        safe_truncate(&response, 200)
+                    )));
+                }
+            }
+        };
 
         Ok(EnhancedQuery {
             reasoning: String::new(),
@@ -776,7 +1140,7 @@ pub struct FileDescription {
     pub title: String,
     pub description: String,
     /// Keywords en español para búsqueda.
-    /// qwen2.5:3b a veces devuelve un string en vez de array, se maneja con deserialize_string_or_vec.
+    /// a veces devuelve un string en vez de array, se maneja con deserialize_string_or_vec.
     #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub keywords: Vec<String>,
     /// Etiquetas semánticas amplias (temas, conceptos, entidades)
@@ -838,7 +1202,7 @@ where
             if value.is_empty() {
                 Ok(Vec::new())
             } else if value.contains(',') {
-                // qwen2.5:3b a veces devuelve "word1, word2, word3" en vez de ["word1","word2","word3"]
+                // a veces devuelve "word1, word2, word3" en vez de ["word1","word2","word3"]
                 Ok(value.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
             } else {
                 Ok(vec![value.to_string()])

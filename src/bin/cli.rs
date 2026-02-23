@@ -1,26 +1,393 @@
 use soas_core::prelude::*;
+use rustyline::completion::{Completer, Pair};
+use rustyline::error::ReadlineError;
+use rustyline::highlight::Highlighter;
+use rustyline::hint::Hinter;
+use rustyline::history::DefaultHistory;
+use rustyline::validate::Validator;
+use rustyline::{Context, Editor, Helper};
+use soas_core::indexer::pipeline::ScanResult;
 use std::io::{self, Write};
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-const DESCARGAS: &str = "/home/eduardo/Descargas";
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CliMode {
+    Normal,
+    Debug,
+}
+
+impl CliMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Debug => "debug",
+        }
+    }
+
+    fn from_value(value: &str) -> Option<Self> {
+        match value.trim().to_lowercase().as_str() {
+            "normal" => Some(Self::Normal),
+            "debug" => Some(Self::Debug),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CliOptions {
+    mode: CliMode,
+    show_help: bool,
+}
+
+const BASE_COMMANDS: &[&str] = &[
+    "help",
+    "stats",
+    "cats",
+    "categorias",
+    "rescan",
+    "rebuild",
+    "reindex",
+    "reimages",
+    "carpetas",
+    "agregar ",
+    "add ",
+    "quitar ",
+    "remove ",
+    "archivos",
+    "files",
+    "ls",
+    "info ",
+    "borrar ",
+    "delete ",
+    "salir",
+    "exit",
+    "q",
+];
+
+fn parse_cli_options() -> CliOptions {
+    let mut mode = std::env::var("SOAS_CLI_MODE")
+        .ok()
+        .and_then(|v| CliMode::from_value(&v))
+        .unwrap_or(CliMode::Normal);
+    let mut show_help = false;
+
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--debug" | "-d" => mode = CliMode::Debug,
+            "--normal" | "-n" => mode = CliMode::Normal,
+            "--help" | "-h" => show_help = true,
+            _ => {
+                if let Some(value) = arg.strip_prefix("--mode=") {
+                    if let Some(parsed) = CliMode::from_value(value) {
+                        mode = parsed;
+                    }
+                }
+            }
+        }
+    }
+
+    CliOptions { mode, show_help }
+}
+
+fn print_startup_help() {
+    println!("SOAS CLI");
+    println!();
+    println!("Uso:");
+    println!("  soas-cli [--normal|--debug] [--help]");
+    println!();
+    println!("Modos:");
+    println!("  --normal, -n   Modo usuario (por defecto): salida limpia con barra de progreso");
+    println!("  --debug,  -d   Modo desarrollador: logs técnicos detallados");
+    println!();
+    println!("Variables de entorno:");
+    println!("  SOAS_CLI_MODE=normal|debug");
+    println!();
+    println!("Dentro del modo interactivo usa 'help' para ver comandos disponibles.");
+}
+
+fn init_logging(mode: CliMode) -> anyhow::Result<()> {
+    let base_filter = tracing_subscriber::EnvFilter::from_default_env();
+    let directive = match mode {
+        CliMode::Normal => "soas_core=error",
+        CliMode::Debug => "soas_core=info",
+    };
+
+    tracing_subscriber::fmt()
+        .with_env_filter(base_filter.add_directive(directive.parse()?))
+        .with_target(matches!(mode, CliMode::Debug))
+        .without_time()
+        .init();
+
+    Ok(())
+}
+
+#[derive(Clone, Default)]
+struct CliHelper {
+    commands: Vec<String>,
+}
+
+impl Helper for CliHelper {}
+impl Validator for CliHelper {}
+impl Highlighter for CliHelper {}
+
+impl Hinter for CliHelper {
+    type Hint = String;
+
+    fn hint(&self, _line: &str, _pos: usize, _ctx: &Context<'_>) -> Option<String> {
+        None
+    }
+}
+
+impl Completer for CliHelper {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        let prefix = &line[..pos];
+        let mut candidates: Vec<Pair> = self
+            .commands
+            .iter()
+            .filter(|cmd| cmd.starts_with(prefix))
+            .take(30)
+            .map(|cmd| Pair {
+                display: cmd.clone(),
+                replacement: cmd.clone(),
+            })
+            .collect();
+
+        if candidates.is_empty() {
+            candidates = self
+                .commands
+                .iter()
+                .filter(|cmd| cmd.contains(prefix))
+                .take(30)
+                .map(|cmd| Pair {
+                    display: cmd.clone(),
+                    replacement: cmd.clone(),
+                })
+                .collect();
+        }
+
+        Ok((0, candidates))
+    }
+}
+
+fn detect_default_scan_path() -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let candidates = ["Descargas", "Downloads", "Documentos", "Documents"];
+
+    for folder in candidates {
+        let candidate = Path::new(&home).join(folder);
+        if candidate.exists() && candidate.is_dir() {
+            return Some(candidate.to_string_lossy().to_string());
+        }
+    }
+
+    let home_path = Path::new(&home);
+    if home_path.exists() && home_path.is_dir() {
+        return Some(home_path.to_string_lossy().to_string());
+    }
+
+    None
+}
+
+fn read_stdin_line() -> anyhow::Result<String> {
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(input.trim().to_string())
+}
+
+async fn ensure_first_folder_if_empty(soas: &mut Soas) -> anyhow::Result<()> {
+    let stats = soas.stats()?;
+    let folders = soas.list_folders()?;
+
+    if stats.total_files > 0 || !folders.is_empty() {
+        return Ok(());
+    }
+
+    let default_path = detect_default_scan_path().unwrap_or_else(|| "./".to_string());
+
+    println!("📂 Base de datos vacía: elige una carpeta inicial para indexar.");
+    println!("   Presiona Enter para usar: {}", default_path);
+    println!("   Escribe 'salir' para omitir por ahora.");
+
+    loop {
+        print!("📁 Carpeta a escanear: ");
+        io::stdout().flush()?;
+        let path_input = read_stdin_line()?;
+
+        if path_input.eq_ignore_ascii_case("salir") || path_input.eq_ignore_ascii_case("exit") {
+            println!("   ⚠️  Inicio sin carpeta. Usa 'agregar <ruta>' después.");
+            println!();
+            return Ok(());
+        }
+
+        let selected_path = if path_input.is_empty() {
+            default_path.clone()
+        } else {
+            path_input
+        };
+
+        let candidate = Path::new(&selected_path);
+        if !candidate.exists() || !candidate.is_dir() {
+            println!("   ❌ Ruta inválida. Ingresa una carpeta existente.");
+            continue;
+        }
+
+        let name = candidate
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or_else(|| "Carpeta inicial".to_string());
+
+        soas.add_folder(&selected_path, &name).await?;
+        println!("   ✅ Carpeta '{}' agregada: {}", name, selected_path);
+        println!();
+        return Ok(());
+    }
+}
+
+fn print_scan_summary(results: &[ScanResult], elapsed_secs: f64) {
+    for result in results {
+        println!("   📊 Resultado del escaneo:");
+        println!("      Nuevos:       {}", result.new_files);
+        println!("      Actualizados: {}", result.updated_files);
+        println!("      Eliminados:   {}", result.deleted_files);
+        println!("      Errores:      {}", result.failed_files);
+        println!("      Total:        {}", result.total_scanned);
+    }
+    println!("   ⏱️  Tiempo: {:.1}s", elapsed_secs);
+    println!();
+}
+
+fn render_progress(progress: &IndexProgress, last_line: &Arc<Mutex<String>>, mode: CliMode) {
+    if progress.total == 0 {
+        return;
+    }
+
+    let processed = (progress.processed + 1).min(progress.total);
+    let percent = (processed as f64 / progress.total as f64 * 100.0).round() as u64;
+    let bar_width = 28usize;
+    let filled = ((processed as f64 / progress.total as f64) * bar_width as f64).round() as usize;
+    let mut bar = String::with_capacity(bar_width);
+    for _ in 0..filled.min(bar_width) {
+        bar.push('█');
+    }
+    for _ in filled.min(bar_width)..bar_width {
+        bar.push('░');
+    }
+
+    let line = if matches!(mode, CliMode::Debug) {
+        let file_name = progress
+            .current_file
+            .as_ref()
+            .and_then(|p| Path::new(p).file_name().map(|f| f.to_string_lossy().to_string()))
+            .unwrap_or_else(|| "archivo".to_string());
+        let short_name: String = file_name.chars().take(42).collect();
+        format!(
+            "   [{}] {:>3}% ({}/{}) | {} | errores: {}",
+            bar, percent, processed, progress.total, short_name, progress.failed
+        )
+    } else {
+        format!(
+            "   Analizando archivos [{}] {:>3}% ({}/{}) | errores: {}",
+            bar, percent, processed, progress.total, progress.failed
+        )
+    };
+
+    if let Ok(mut guard) = last_line.lock() {
+        *guard = line.clone();
+    }
+
+    print!("\r{}\x1b[K", line);
+    let _ = io::stdout().flush();
+}
+
+async fn run_scan_with_progress(soas: &mut Soas, mode: CliMode) -> anyhow::Result<Vec<ScanResult>> {
+    let last_line = Arc::new(Mutex::new(String::new()));
+    let progress_state = Arc::clone(&last_line);
+    let callback = move |progress: IndexProgress| {
+        render_progress(&progress, &progress_state, mode);
+    };
+
+    let results = soas.scan_all_with_progress(Some(&callback)).await?;
+    if let Ok(guard) = last_line.lock() {
+        if !guard.is_empty() {
+            println!();
+        }
+    }
+
+    Ok(results)
+}
+
+fn build_completion_candidates(soas: &Soas) -> Vec<String> {
+    let mut commands: Vec<String> = BASE_COMMANDS.iter().map(|c| c.to_string()).collect();
+
+    if let Ok(files) = soas.list_files() {
+        for idx in 1..=files.len() {
+            commands.push(format!("info {}", idx));
+            commands.push(format!("borrar {}", idx));
+        }
+    }
+
+    if let Ok(folders) = soas.list_folders() {
+        for idx in 1..=folders.len() {
+            commands.push(format!("quitar {}", idx));
+        }
+    }
+
+    commands.sort();
+    commands.dedup();
+    commands
+}
+
+fn print_help() {
+    println!("═══════════════════════════════════════════");
+    println!("  Búsqueda interactiva (CLI)");
+    println!("  Busca en lenguaje natural. Ejemplos:");
+    println!("   • \"foto de perfil con fondo blanco\"");
+    println!("   • \"contrato en pdf de 2024\"");
+    println!("   • \"presentación sobre presupuesto\"");
+    println!("  Comandos especiales:");
+    println!("   help | stats | cats | rescan | rebuild | reindex | reimages | salir");
+    println!("   carpetas         = lista carpetas monitoreadas");
+    println!("   agregar <ruta>   = agrega una carpeta para indexar");
+    println!("   quitar <num>     = elimina carpeta y sus archivos del índice");
+    println!("   archivos         = lista todos los archivos indexados");
+    println!("   info <num>       = muestra detalles de un archivo");
+    println!("   borrar <num>     = elimina un archivo del índice");
+    println!("   🔄 rebuild       = regenera embeddings");
+    println!("   🖼️  reimages     = re-analiza solo imágenes");
+    println!("   TAB              = autocompleta comandos dinámicos");
+    println!("   Modo CLI         = --normal (limpio) | --debug (logs técnicos)");
+    println!("═══════════════════════════════════════════");
+    println!();
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Logging
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("soas_core=info".parse()?),
-        )
-        .init();
+    let options = parse_cli_options();
+    if options.show_help {
+        print_startup_help();
+        return Ok(());
+    }
+
+    init_logging(options.mode)?;
 
     println!("╔══════════════════════════════════════════╗");
-    println!("║        SOAS - CLI de prueba              ║");
+    println!("║                SOAS CLI                  ║");
     println!("║   Sistema Inteligente de Búsqueda        ║");
     println!("╚══════════════════════════════════════════╝");
+    println!("Modo: {}", options.mode.as_str());
+    println!("Tip: escribe 'help' para ver comandos.");
     println!();
 
-    // 1. Inicializar SOAS
     println!("⏳ Inicializando SOAS...");
     let mut soas = Soas::new(SoasConfig::default())?;
     println!("✅ SOAS inicializado");
@@ -47,7 +414,7 @@ async fn main() -> anyhow::Result<()> {
     let models = soas.list_ollama_models().await?;
     println!("✅ {} modelos disponibles", models.len());
 
-    let required = ["nomic-embed-text", "qwen2.5:3b", "qwen3-vl:2b"];
+    let required = ["nomic-embed-text", "qwen3:1.7b", "llava-phi3"];
     for model in &required {
         let found = models.iter().any(|m| m.contains(model));
         if found {
@@ -58,20 +425,24 @@ async fn main() -> anyhow::Result<()> {
     }
     println!();
 
-    // 4. Agregar carpeta de Descargas
-    println!("📁 Configurando carpeta: {}", DESCARGAS);
+    ensure_first_folder_if_empty(&mut soas).await?;
+
     let folders = soas.list_folders()?;
-    let already_added = folders.iter().any(|f| f.path.to_string_lossy() == DESCARGAS);
-
-    if already_added {
-        println!("   (ya estaba registrada)");
+    if folders.is_empty() {
+        println!("⚠️  No hay carpetas registradas todavía.");
+        println!("   Usa 'agregar <ruta>' en el modo interactivo para comenzar.");
+        println!();
     } else {
-        soas.add_folder(DESCARGAS, "Descargas").await?;
-        println!("   ✅ Carpeta agregada");
+        println!("📁 Carpetas registradas: {}", folders.len());
+        for f in folders.iter().take(3) {
+            println!("   • {}", f.path.display());
+        }
+        if folders.len() > 3 {
+            println!("   • ... y {} más", folders.len() - 3);
+        }
+        println!();
     }
-    println!();
 
-    // 5. Crear categorías por defecto
     let vfs = soas.virtual_fs();
     let existing_cats = soas.stats()?.total_categories;
     if existing_cats == 0 {
@@ -84,27 +455,17 @@ async fn main() -> anyhow::Result<()> {
     }
     println!();
 
-    // 6. Escanear e indexar
-    println!("🔍 Escaneando e indexando {}...", DESCARGAS);
-    println!("   Solo se procesarán archivos nuevos o modificados.");
-    println!();
+    if !folders.is_empty() {
+        println!("🔍 Escaneando e indexando carpetas registradas...");
+        println!("   Solo se procesarán archivos nuevos o modificados.");
+        println!();
 
-    let start = Instant::now();
-    let results = soas.scan_all().await?;
-    let elapsed = start.elapsed();
-
-    for result in &results {
-        println!("   📊 Resultado del escaneo:");
-        println!("      Nuevos:       {}", result.new_files);
-        println!("      Actualizados: {}", result.updated_files);
-        println!("      Eliminados:   {}", result.deleted_files);
-        println!("      Errores:      {}", result.failed_files);
-        println!("      Total:        {}", result.total_scanned);
+        let start = Instant::now();
+        let results = run_scan_with_progress(&mut soas, options.mode).await?;
+        let elapsed = start.elapsed();
+        print_scan_summary(&results, elapsed.as_secs_f64());
     }
-    println!("   ⏱️  Tiempo: {:.1}s", elapsed.as_secs_f64());
-    println!();
 
-    // 7. Estadísticas
     let stats = soas.stats()?;
     println!("📈 Estadísticas del sistema:");
     println!("   Archivos indexados:  {}", stats.total_files);
@@ -117,33 +478,38 @@ async fn main() -> anyhow::Result<()> {
     );
     println!();
 
-    // 8. Loop interactivo de búsqueda
-    println!("═══════════════════════════════════════════");
-    println!("  Búsqueda interactiva");
-    println!("  Busca en lenguaje natural. Ejemplos:");
-    println!("   • \"foto de mi credencial INE\"");
-    println!("   • \"informe de actividades de noviembre\"");
-    println!("   • \"pdf sobre licitaciones del gobierno\"");
-    println!("  Comandos especiales:");
-    println!("   stats | cats | rescan | rebuild | reindex | reimages | salir");
-    println!("   carpetas         = lista carpetas monitoreadas");
-    println!("   agregar <ruta>   = agrega una carpeta para indexar");
-    println!("   quitar <num>     = elimina carpeta y sus archivos del índice");
-    println!("   archivos         = lista todos los archivos indexados");
-    println!("   info <num>       = muestra detalles de un archivo");
-    println!("   borrar <num>     = elimina un archivo del índice");
-    println!("   🔄 rebuild       = regenera embeddings con formato mejorado");
-    println!("   🖼️  reimages     = re-analiza solo imágenes (visión+LLM)");
-    println!("═══════════════════════════════════════════");
-    println!();
+    print_help();
+
+    let mut rl: Editor<CliHelper, DefaultHistory> = Editor::new()?;
 
     loop {
-        print!("🔎 Buscar: ");
-        io::stdout().flush()?;
+        let helper = CliHelper {
+            commands: build_completion_candidates(&soas),
+        };
+        rl.set_helper(Some(helper));
 
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-        let query = input.trim();
+        let query = match rl.readline("🔎 Buscar: ") {
+            Ok(line) => {
+                let trimmed = line.trim().to_string();
+                if !trimmed.is_empty() {
+                    let _ = rl.add_history_entry(trimmed.as_str());
+                }
+                trimmed
+            }
+            Err(ReadlineError::Interrupted) => {
+                println!("\n👋 ¡Hasta luego!");
+                break;
+            }
+            Err(ReadlineError::Eof) => {
+                println!();
+                println!("👋 ¡Hasta luego!");
+                break;
+            }
+            Err(e) => {
+                println!("   ❌ Error leyendo entrada: {}", e);
+                continue;
+            }
+        };
 
         if query.is_empty() {
             continue;
@@ -152,10 +518,14 @@ async fn main() -> anyhow::Result<()> {
             break;
         }
 
-        // Comandos especiales
+        if query == "help" || query == "ayuda" {
+            print_help();
+            continue;
+        }
+
         if query == "stats" {
             let s = soas.stats()?;
-            println!("   Archivos: {} | Embeddings: {} | Categorías: {}", 
+            println!("   Archivos: {} | Embeddings: {} | Categorías: {}",
                 s.total_files, s.total_embedded, s.total_categories);
             println!();
             continue;
@@ -178,13 +548,9 @@ async fn main() -> anyhow::Result<()> {
         if query.starts_with("rescan") {
             println!("   ⏳ Re-escaneando...");
             let start = Instant::now();
-            let results = soas.scan_all().await?;
+            let results = run_scan_with_progress(&mut soas, options.mode).await?;
             let elapsed = start.elapsed();
-            for r in &results {
-                println!("   Nuevos: {} | Actualizados: {} | ⏱️ {:.1}s",
-                    r.new_files, r.updated_files, elapsed.as_secs_f64());
-            }
-            println!();
+            print_scan_summary(&results, elapsed.as_secs_f64());
             continue;
         }
 
@@ -322,10 +688,10 @@ async fn main() -> anyhow::Result<()> {
                     };
                     let size_kb = f.size as f64 / 1024.0;
                     let status = match &f.index_status {
-                        soas_core::prelude::IndexStatus::Indexed => "✅",
-                        soas_core::prelude::IndexStatus::Failed(_) => "❌",
-                        soas_core::prelude::IndexStatus::Pending => "⏳",
-                        soas_core::prelude::IndexStatus::ContentExtracted => "📝",
+                        IndexStatus::Indexed => "✅",
+                        IndexStatus::Failed(_) => "❌",
+                        IndexStatus::Pending => "⏳",
+                        IndexStatus::ContentExtracted => "📝",
                         _ => "❓",
                     };
                     println!("   {:>3}. {} {} {} ({:.0} KB) {}",
@@ -408,9 +774,14 @@ async fn main() -> anyhow::Result<()> {
             continue;
         }
 
-        // Búsqueda semántica
+        if query == "ifo" || query.starts_with("ifo ") {
+            println!("   ¿Quisiste decir 'info <número>'? Usa TAB para autocompletar.");
+            println!();
+            continue;
+        }
+
         let start = Instant::now();
-        match soas.search(query).await {
+        match soas.search(&query).await {
             Ok(results) => {
                 let elapsed = start.elapsed();
                 if results.is_empty() {

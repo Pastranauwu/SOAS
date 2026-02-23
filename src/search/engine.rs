@@ -32,9 +32,15 @@ const TYPE_INTENT_MAP: &[(&[&str], &[&str], bool)] = &[
         &["jpg", "jpeg", "png", "gif", "webp", "svg", "bmp", "tiff", "tif", "heic"],
         true,  // filtro duro: si dices "foto" claramente buscas imagen
     ),
-    // Documentos Word
+    // Documentos Word (intención explícita)
     (
-        &["word", "docx", "documento", "documentos", "carta", "oficio",
+        &["word", "doc", "docx", "odt", "rtf"],
+        &["docx", "doc", "odt", "rtf"],
+        true,
+    ),
+    // Documentos (intención genérica)
+    (
+        &["documento", "documentos", "carta", "oficio",
           "escrito", "texto", "redaccion", "redacción"],
         &["docx", "doc", "odt", "rtf"],
         false, // no duro: "documento" puede querer decir también PDF
@@ -125,6 +131,89 @@ impl<'a> SearchEngine<'a> {
         }
     }
 
+    /// Extrae tokens "de memoria" desde consulta en lenguaje natural
+    /// (palabras informativas que pueden aparecer en nombre/keywords/descripción).
+    fn memory_tokens(query: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        for token in query
+            .split(|c: char| !c.is_alphanumeric())
+            .map(|w| w.trim().to_lowercase())
+            .filter(|w| w.len() >= 3)
+        {
+            if STOP_WORDS_ES.contains(&token.as_str()) {
+                continue;
+            }
+            if seen.insert(token.clone()) {
+                out.push(token);
+            }
+        }
+
+        out
+    }
+
+    /// Re-ranking léxico para consultas de recuerdo humano.
+    /// Mejora casos como: "mi credencial del ine", "por detrás", etc.
+    fn apply_memory_recall_boost(mut results: Vec<SearchResult>, query_text: &str) -> Vec<SearchResult> {
+        if results.is_empty() {
+            return results;
+        }
+
+        let tokens = Self::memory_tokens(query_text);
+        if tokens.is_empty() {
+            return results;
+        }
+
+        let q = query_text.to_lowercase();
+        let asks_back = ["detras", "detrás", "posterior", "reverso", "atras", "atrás", "back"]
+            .iter()
+            .any(|k| q.contains(k));
+        let asks_front = ["frente", "frontal", "anverso", "front"]
+            .iter()
+            .any(|k| q.contains(k));
+
+        for r in &mut results {
+            let desc = r.file.metadata.description.as_deref().unwrap_or("");
+            let title = r.file.metadata.title.as_deref().unwrap_or("");
+            let keywords = r.file.metadata.keywords.join(" ");
+            let haystack = format!(
+                "{} {} {} {} {}",
+                r.file.filename,
+                title,
+                desc,
+                r.file.content_preview,
+                keywords
+            )
+            .to_lowercase();
+
+            let token_hits = tokens.iter().filter(|t| haystack.contains(t.as_str())).count();
+            let lexical_bonus = (token_hits as f32 * 0.03).min(0.15);
+            r.score = (r.score + lexical_bonus).min(1.0);
+
+            if asks_back {
+                let back_hit = ["posterior", "reverso", "detras", "detrás", "atras", "atrás", "back"]
+                    .iter()
+                    .any(|k| haystack.contains(k));
+                if back_hit {
+                    r.score = (r.score + 0.08).min(1.0);
+                }
+            }
+
+            if asks_front {
+                let front_hit = ["frente", "frontal", "anverso", "front"]
+                    .iter()
+                    .any(|k| haystack.contains(k));
+                if front_hit {
+                    r.score = (r.score + 0.08).min(1.0);
+                }
+            }
+        }
+
+        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        results
+    }
+
     /// Detecta intención de tipo de archivo usando reglas locales (sin LLM).
     /// Devuelve (extensiones_detectadas, es_filtro_duro).
     /// Rápido y determinista — complementa al LLM.
@@ -188,7 +277,10 @@ impl<'a> SearchEngine<'a> {
         // La búsqueda semántica usa la query ORIGINAL del usuario (nomic-embed-text
         // ya maneja lenguaje natural bien). El LLM solo aporta keywords para FTS
         // y detección de tipo — no necesitamos esperar al LLM para buscar.
-        let semantic_future = self.search_semantic(&query.text, query.limit, query.min_score);
+        // Pedir más candidatos semánticos que el límite final para mejorar recall.
+        // Con límite estricto (ej: 5), archivos relevantes pueden quedar fuera antes
+        // de fusionar con FTS (ej: ine_posterior solo aparece por FTS).
+        let semantic_future = self.search_semantic(&query.text, query.limit + 20, query.min_score);
 
         let enhance_future = async {
             if self.config.use_query_enhancement {
@@ -241,12 +333,10 @@ impl<'a> SearchEngine<'a> {
                     combined_extensions.push(ext_lower);
                 }
             }
-            // La IA confirma filtro duro solo si ambas coinciden
-            if eq.hard_type_filter && rule_is_hard {
-                is_hard_filter = true;
-            }
-            // Si la IA detecta tipo claro y no tenemos reglas, confiar en la IA
-            if rule_extensions.is_empty() && eq.hard_type_filter && !eq.file_types.is_empty() {
+            // Seguridad: SOLO reglas locales activan filtro duro.
+            // El LLM puede alucinar tipos (ej: pdf/doc/xls/txt) y dejar en 0 resultados.
+            // Sus extensiones se usan como señal suave (bonus), nunca exclusión estricta.
+            if rule_is_hard {
                 is_hard_filter = true;
             }
         }
@@ -335,6 +425,9 @@ impl<'a> SearchEngine<'a> {
             }
         }
 
+        // ── 7.5 Re-ranking por señales de "recuerdo" en lenguaje natural ──
+        combined = Self::apply_memory_recall_boost(combined, &query.text);
+
         // ── 8. Cortar por brecha de relevancia ────────────────────────────────
         combined = Self::cut_at_relevance_gap(combined);
 
@@ -353,9 +446,8 @@ impl<'a> SearchEngine<'a> {
     /// y corta ahí. Esto elimina el "ruido" de archivos con score bajo que no son
     /// realmente relevantes a la consulta.
     ///
-    /// Usa dos estrategias complementarias:
-    /// 1. Detección de gap: busca el salto más grande entre scores consecutivos
-    /// 2. Score floor adaptivo: más agresivo si los scores están concentrados
+    /// Estrategia: score floor primero (eliminar basura), luego gap detection.
+    /// Garantiza mínimo 2 resultados si están por encima del floor.
     fn cut_at_relevance_gap(mut results: Vec<SearchResult>) -> Vec<SearchResult> {
         if results.len() <= 1 {
             return results;
@@ -366,22 +458,52 @@ impl<'a> SearchEngine<'a> {
             return results;
         }
 
-        // ── 1. Gap detection ─────────────────────────────────────────────
-        // Buscar la mayor brecha relativa entre resultados consecutivos.
-        // Umbral mínimo: 3% del score en esa posición (mín absoluto 0.02)
+        // ── 1. Score floor (primero) ─────────────────────────────────────
+        // Eliminar resultados claramente irrelevantes antes de buscar gaps.
+        // Esto evita que un resultado lejano (0.52) cree un gap artificial
+        // que enmascare la distribución de los resultados relevantes.
+        let score_floor = (top_score * 0.82).max(0.42);
+        let before_floor = results.len();
+        results.retain(|r| r.score >= score_floor);
+        if results.len() < before_floor {
+            debug!(
+                "Score floor {:.3} eliminó {} resultados irrelevantes",
+                score_floor,
+                before_floor - results.len()
+            );
+        }
+
+        if results.len() <= 2 {
+            return results;
+        }
+
+        // ── 2. Gap detection (después del floor) ─────────────────────────
+        // Buscar la mayor brecha entre resultados consecutivos.
+        // Umbral: 12% relativo al score en esa posición (mín absoluto 0.06).
+        // 3% era demasiado bajo: un gap de 0.08 en scores de 0.79→0.71
+        // cortaba informes de actividades que TODOS eran relevantes.
         let mut max_gap = 0.0f32;
         let mut cut_index = results.len();
 
         for i in 0..results.len() - 1 {
             let gap = results[i].score - results[i + 1].score;
-            let relative_threshold = (results[i].score * 0.03).max(0.02);
+            let relative_threshold = (results[i].score * 0.12).max(0.06);
             if gap > max_gap && gap >= relative_threshold {
                 max_gap = gap;
                 cut_index = i + 1;
             }
         }
 
-        if cut_index < results.len() && cut_index >= 1 {
+        // Garantizar mínimo 2 resultados: si el gap cortaría a solo 1,
+        // solo cortar si la brecha es realmente enorme (>20%).
+        if cut_index == 1 {
+            let gap_ratio = max_gap / results[0].score;
+            if gap_ratio < 0.20 {
+                cut_index = results.len(); // no cortar
+            }
+        }
+
+        if cut_index < results.len() && cut_index >= 2 {
             debug!(
                 "Cortando en posición {} (gap={:.4}, scores: {:.4} → {:.4})",
                 cut_index,
@@ -392,45 +514,86 @@ impl<'a> SearchEngine<'a> {
             results.truncate(cut_index);
         }
 
-        // ── 2. Adaptive score floor ──────────────────────────────────────
-        // Si los scores están muy concentrados (rango < 0.10), el modelo de
-        // embeddings no discrimina bien → ser más agresivo con el corte.
-        // Si están dispersos, ser más permisivo.
-        let min_score = results.last().map(|r| r.score).unwrap_or(0.0);
-        let score_range = top_score - min_score;
+        results
+    }
 
-        // LÓGICA CORREGIDA: cuando el rango es estrecho, el modelo NO discrimina
-        // → ser MÁS permisivo (mostrar más resultados, no menos).
-        // Cuando el rango es amplio, el modelo SÍ discrimina → ser más selectivo.
-        let floor_ratio = if score_range < 0.05 {
-            // Scores prácticamente iguales: el modelo no discrimina.
-            // Mostrar todos los razonablemente relevantes.
-            0.70
-        } else if score_range < 0.10 {
-            // Rango estrecho: ser permisivo
-            0.78
-        } else if score_range < 0.20 {
-            // Rango moderado: balance
-            0.85
-        } else {
-            // Rango amplio: el modelo discrimina bien, ser más selectivo
-            0.92
-        };
+    /// Construye el snippet más útil para mostrar en resultados de búsqueda.
+    ///
+    /// Prioridad:
+    /// 1. metadata.description (resumen semántico del LLM o visión) — más informativo
+    /// 2. content_preview — extracto real del contenido
+    /// 3. Nombre del archivo humanizado — último recurso
+    ///
+    /// Para imágenes, el content_preview suele ser "Resumen visual (fallback)..."
+    /// que no es útil. La description (si existe) siempre es mejor.
+    fn build_result_snippet(file: &IndexedFile) -> String {
+        let is_image = matches!(
+            file.extension.as_str(),
+            "jpg" | "jpeg" | "png" | "bmp" | "tiff" | "webp" | "gif" | "svg" | "heic"
+        );
 
-        let score_floor = (top_score * floor_ratio).max(0.42);
-        let before = results.len();
-        results.retain(|r| r.score >= score_floor);
-        if results.len() < before {
-            debug!(
-                "Score floor adaptivo {:.3} (ratio={:.0}%, rango={:.3}) eliminó {} resultados",
-                score_floor,
-                floor_ratio * 100.0,
-                score_range,
-                before - results.len()
-            );
+        // Para imágenes: preferir description ya que content_preview puede ser un
+        // fallback genérico del nombre de archivo
+        if is_image {
+            if let Some(ref desc) = file.metadata.description {
+                let d = desc.trim();
+                // Preferir description si parece un resumen real (no solo nombre de archivo)
+                // Las descripciones buenas de los modelos VL suelen tener >50 chars y frases completas
+                if !d.is_empty() && d.len() > 50 {
+                    return d.chars().take(200).collect();
+                }
+            }
+            // Intentar content_preview si no es un fallback genérico
+            if !file.content_preview.is_empty() {
+                let cp = file.content_preview.trim();
+                // content_preview con resumen visual real suele ser descriptivo
+                if cp.len() > 50 && !cp.starts_with("Imagen:") {
+                    return cp.chars().take(200).collect::<String>();
+                }
+            }
+            // Para imágenes sin buena description, construir algo útil
+            let mut parts = Vec::new();
+            if let Some(ref title) = file.metadata.title {
+                if !title.is_empty() && *title != file.filename {
+                    parts.push(title.clone());
+                }
+            }
+            if !file.metadata.keywords.is_empty() {
+                parts.push(format!("[{}]", file.metadata.keywords.join(", ")));
+            }
+            if parts.is_empty() {
+                // Humanizar el nombre del archivo
+                let clean = file.filename
+                    .replace(['_', '-', '.'], " ")
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                return clean;
+            }
+            return parts.join(" — ").chars().take(200).collect();
         }
 
-        results
+        // Para documentos: preferir description si es informativa, sino content_preview
+        if let Some(ref desc) = file.metadata.description {
+            let d = desc.trim();
+            if !d.is_empty() && d.len() > 20 {
+                return d.chars().take(200).collect();
+            }
+        }
+
+        if !file.content_preview.is_empty() {
+            return file.content_preview
+                .chars()
+                .take(200)
+                .collect::<String>();
+        }
+
+        // Último recurso
+        file.filename
+            .replace(['_', '-', '.'], " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// Búsqueda semántica usando embeddings
@@ -452,11 +615,7 @@ impl<'a> SearchEngine<'a> {
         let mut results = Vec::new();
         for m in matches {
             if let Ok(Some(file)) = self.storage.get_file_by_id(&m.file_id) {
-                let snippet = file
-                    .content_preview
-                    .chars()
-                    .take(200)
-                    .collect::<String>();
+                let snippet = Self::build_result_snippet(&file);
 
                 results.push(SearchResult {
                     file,
@@ -492,11 +651,7 @@ impl<'a> SearchEngine<'a> {
         let results: Vec<SearchResult> = fts_results
             .into_iter()
             .map(|(file, rank)| {
-                let snippet = file
-                    .content_preview
-                    .chars()
-                    .take(200)
-                    .collect::<String>();
+                let snippet = Self::build_result_snippet(&file);
 
                 // Normalizar rank de FTS5 a un score 0-1
                 // FTS5 rank: más negativo = más relevante (rank.abs() mayor = más relevante)
@@ -581,8 +736,11 @@ impl<'a> SearchEngine<'a> {
                     // Solo semántico: score directo
                     sem_score
                 } else {
-                    // Solo FTS: poco fiable sin confirmación semántica
-                    fts_score * 0.40
+                    // Solo FTS: señal léxica fuerte (nombres/ruta/contenido exacto).
+                    // Antes (*0.40) era demasiado bajo y expulsaba resultados válidos
+                    // como "ine_posterior.jpeg" aunque fueran match claro.
+                    // Mantenerlo por debajo de semántico alto, pero competitivo.
+                    (fts_score * 0.90 + 0.12).min(0.65)
                 };
 
                 if final_score < min_score {

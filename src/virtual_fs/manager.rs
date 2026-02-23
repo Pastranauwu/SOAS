@@ -188,10 +188,14 @@ impl<'a> VirtualFsManager<'a> {
             .suggest_categories(&file.filename, &file.content_preview, &category_names)
             .await?;
 
+        let folder_path = file.path.parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+
         // Pedir nombre virtual sugerido
         let description = self
             .ollama
-            .describe_file(&file.filename, &file.content_preview)
+            .describe_file(&file.filename, &file.content_preview, &folder_path)
             .await
             .ok();
 

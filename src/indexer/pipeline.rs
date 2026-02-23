@@ -75,6 +75,9 @@ impl<'a> IndexPipeline<'a> {
         let stopwords = [
             "de", "del", "la", "las", "el", "los", "y", "o", "en", "con", "para", "por", "un", "una",
             "uno", "una", "que", "es", "al", "se", "sin", "archivo", "imagen", "resumen", "visual",
+            "muestra", "puede", "ver", "tiene", "como", "son", "esta", "este", "esto", "una",
+            "hay", "con", "muy", "mas", "pero", "también", "fue", "ser", "sobre", "todo",
+            "posible", "contenido", "nombre", "semántico", "semantic",
         ];
 
         let mut out = Vec::new();
@@ -97,6 +100,122 @@ impl<'a> IndexPipeline<'a> {
         }
 
         out
+    }
+
+    /// Extrae keywords semánticas ricas para imágenes.
+    ///
+    /// A diferencia de `derive_keywords` (que tokeniza palabras sueltas),
+    /// esta función:
+    /// 1. Detecta entidades y frases significativas del nombre de archivo
+    /// 2. Extrae conceptos clave de la descripción visual (si existe)
+    /// 3. Produce keywords que son útiles para búsqueda en lenguaje natural
+    ///
+    /// Ejemplo: "ine_posterior.jpeg" + descripción de INE →
+    /// ["INE", "credencial", "identificación", "INE posterior", "documento oficial"]
+    /// en vez de: ["ine", "posterior", "jpeg"]
+    fn derive_image_keywords(filename: &str, vision_description: &str) -> Vec<String> {
+        let mut keywords = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        let clean_name = filename
+            .replace(['_', '-', '.'], " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase();
+
+        let desc_lower = vision_description.to_lowercase();
+        let combined = format!("{} {}", clean_name, desc_lower);
+
+        // ── 1) Detectar entidades/conceptos conocidos ──────────────────────
+        // Mapeo: (patrones_a_buscar, keywords_a_generar)
+        let entity_map: &[(&[&str], &[&str])] = &[
+            // Documentos de identidad
+            (&["ine", "instituto nacional electoral", "credencial para votar", "credencial elector"],
+             &["INE", "credencial", "identificación oficial", "credencial de elector"]),
+            (&["curp"], &["CURP", "clave única de registro"]),
+            (&["rfc"], &["RFC", "registro federal de contribuyentes"]),
+            (&["pasaporte"], &["pasaporte", "documento de viaje"]),
+            (&["licencia", "conducir"], &["licencia de conducir"]),
+            (&["acta", "nacimiento"], &["acta de nacimiento"]),
+            (&["acta", "matrimonio"], &["acta de matrimonio"]),
+            (&["comprobante", "domicilio"], &["comprobante de domicilio"]),
+            // Documentos laborales/oficiales
+            (&["carta", "hechos"], &["carta de hechos"]),
+            (&["informe", "actividades"], &["informe de actividades"]),
+            (&["acta administrativa"], &["acta administrativa"]),
+            (&["licitacion", "licitación"], &["licitación"]),
+            (&["constancia"], &["constancia"]),
+            (&["diploma", "certificado", "titulo", "título"], &["certificado", "diploma"]),
+            (&["factura"], &["factura"]),
+            (&["recibo", "comprobante"], &["recibo", "comprobante"]),
+            (&["contrato"], &["contrato"]),
+            (&["nómina", "nomina"], &["nómina", "recibo de nómina"]),
+            // Orientación de imagen
+            (&["frente", "frontal", "front"], &["frente", "vista frontal"]),
+            (&["posterior", "reverso", "atras", "back"], &["reverso", "vista posterior"]),
+            // Fotos
+            (&["selfie", "retrato", "foto"], &["fotografía"]),
+            (&["screenshot", "captura", "pantalla"], &["captura de pantalla"]),
+        ];
+
+        for (patterns, kw_to_add) in entity_map {
+            let matched = patterns.iter().all(|p| combined.contains(p));
+            if matched {
+                for kw in *kw_to_add {
+                    let kw_lower = kw.to_lowercase();
+                    if seen.insert(kw_lower) {
+                        keywords.push(kw.to_string());
+                    }
+                }
+            }
+        }
+
+        // ── 2) Extraer palabras significativas del nombre ──────────────────
+        let name_stopwords = [
+            "jpg", "jpeg", "png", "gif", "bmp", "tiff", "webp", "svg", "heic",
+            "img", "image", "foto", "photo", "pic", "screenshot",
+        ];
+        for word in clean_name.split_whitespace() {
+            if word.len() >= 3
+                && !name_stopwords.contains(&word)
+                && seen.insert(word.to_string())
+            {
+                keywords.push(word.to_string());
+            }
+        }
+
+        // ── 3) Extraer conceptos sustantivos de la descripción visual ──────
+        // Buscar frases sustantivas relevantes (no solo tokens sueltos)
+        if !vision_description.is_empty() {
+            let desc_stopwords = [
+                "imagen", "muestra", "puede", "tiene", "como", "donde", "esta",
+                "este", "esto", "sobre", "todo", "también", "sido", "siendo",
+                "hay", "ver", "con", "sin", "los", "las", "del", "una", "uno",
+                "para", "por", "que", "son", "fue", "ser", "más", "muy",
+                "esquina", "superior", "inferior", "derecha", "izquierda",
+                "parte", "lado", "fondo", "centro", "arriba", "abajo",
+                "chars", "oficial",
+            ];
+
+            // Extraer palabras relevantes de la descripción
+            for token in desc_lower
+                .split(|c: char| !c.is_alphanumeric() && c != 'á' && c != 'é' && c != 'í' && c != 'ó' && c != 'ú' && c != 'ñ')
+                .map(|w| w.trim())
+                .filter(|w| w.len() >= 4)
+            {
+                if !desc_stopwords.contains(&token) && seen.insert(token.to_string()) {
+                    keywords.push(token.to_string());
+                    if keywords.len() >= 12 {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Limitar a un máximo razonable
+        keywords.truncate(10);
+        keywords
     }
 
     fn should_use_llm_enrichment_for_file(file: &IndexedFile) -> bool {
@@ -425,7 +544,7 @@ impl<'a> IndexPipeline<'a> {
                     "📄 Contenido [{:?}]: {} chars | preview: {:?}",
                     path.file_name().unwrap_or_default(),
                     file.content_full.len(),
-                    safe_truncate(&file.content_preview, 100)
+                    safe_truncate(&file.content_preview, 250)
                 );
             }
             Err(e) => {
@@ -451,12 +570,15 @@ impl<'a> IndexPipeline<'a> {
                 Some(file.content_preview.clone())
             };
 
-            let mut keyword_source = Self::normalize_filename_for_text(&file.filename);
-            if !file.content_preview.is_empty() {
-                keyword_source.push(' ');
-                keyword_source.push_str(&file.content_preview);
-            }
-            file.metadata.keywords = Self::derive_keywords(&keyword_source, 8);
+            // Usar extracción semántica de keywords que entiende contexto,
+            // no solo tokenización de palabras sueltas.
+            // Ej: "ine_posterior.jpeg" + desc "documento INE" →
+            //   ["INE", "credencial", "identificación oficial", "posterior"]
+            // en vez de: ["ine", "posterior", "jpeg"]
+            file.metadata.keywords = Self::derive_image_keywords(
+                &file.filename,
+                &file.content_preview,
+            );
 
             let mut tags = vec!["imagen".to_string()];
             tags.extend(file.metadata.keywords.iter().take(3).cloned());
@@ -464,54 +586,112 @@ impl<'a> IndexPipeline<'a> {
             file.metadata.content_type_group = Some("imagen".to_string());
 
             info!(
-                "🏷️  Metadatos imagen (local, sin LLM) [{:?}]: keywords={:?}",
+                "🏷️  Metadatos imagen [{:?}]: keywords={:?}, desc_len={}",
                 path.file_name().unwrap_or_default(),
-                &file.metadata.keywords
+                &file.metadata.keywords,
+                file.metadata.description.as_ref().map(|d| d.len()).unwrap_or(0),
             );
         } else {
             // Siempre dejar baseline local para robustez y velocidad.
             Self::ensure_local_metadata_baseline(&mut file);
         }
 
-        // Paso 2: (Opcional) Enriquecer metadatos con LLM para no-imágenes prioritarias.
+        let image_fallback_method = file
+            .metadata
+            .extra
+            .get("ocr")
+            .cloned()
+            .unwrap_or_default();
+        let should_rescue_image_with_llm = is_image
+            && self.config.use_llm_enrichment
+            && image_fallback_method.starts_with("qwen3vl-fallback");
+
+        // Paso 2: (Opcional) Enriquecer metadatos con LLM para no-imágenes prioritarias,
+        // o rescatar imágenes que cayeron en fallback de visión.
         let should_use_llm = self.config.use_llm_enrichment
             && !is_image
             && Self::should_use_llm_enrichment_for_file(&file);
 
-        if should_use_llm {
+        if should_use_llm || should_rescue_image_with_llm {
             let llm_context = if !file.content_full.is_empty() {
                 Self::build_llm_context_excerpt(&file.content_full)
             } else {
                 safe_truncate(&file.content_preview, 1200).to_string()
             };
 
-            match self.ollama.describe_file(&file.filename, &llm_context).await {
+            // Extraer ruta de carpeta relativa al home del usuario para contexto
+            let folder_context = file.path.parent()
+                .map(|p| {
+                    let ps = p.to_string_lossy();
+                    // Recortar /home/usuario/ para mostrar solo la ruta relativa
+                    if let Some(idx) = ps.find("/home/") {
+                        let rest = &ps[idx + 6..];
+                        if let Some(slash) = rest.find('/') {
+                            return rest[slash + 1..].to_string();
+                        }
+                    }
+                    ps.to_string()
+                })
+                .unwrap_or_default();
+
+            match self.ollama.describe_file(&file.filename, &llm_context, &folder_context).await {
                 Ok(desc) => {
-                    // Solo sobreescribir si no había metadatos previos
-                    if file.metadata.title.is_none() {
-                        file.metadata.title = Some(desc.title);
+                    // Para imágenes en fallback: preferir metadatos del LLM si son útiles.
+                    // Para no-imágenes: mantener estrategia conservadora (rellenar vacíos).
+                    if should_rescue_image_with_llm {
+                        if !desc.title.trim().is_empty() {
+                            file.metadata.title = Some(desc.title);
+                        }
+                        if !desc.description.trim().is_empty() {
+                            file.metadata.description = Some(desc.description);
+                        }
+                        if !desc.keywords.is_empty() {
+                            file.metadata.keywords = desc.keywords;
+                        }
+                        if !desc.semantic_tags.is_empty() {
+                            file.metadata.semantic_tags = desc.semantic_tags;
+                        }
+                        if let Some(lang) = desc.language {
+                            file.metadata.language = Some(lang);
+                        }
+                        file.metadata.content_type_group = Some(
+                            desc.content_type_group.unwrap_or_else(|| "imagen".to_string())
+                        );
+                        info!(
+                            "🧠 Rescate LLM imagen fallback [{:?}] (método={}): keywords={:?}, tags={:?}",
+                            path.file_name().unwrap_or_default(),
+                            image_fallback_method,
+                            &file.metadata.keywords,
+                            &file.metadata.semantic_tags
+                        );
+                    } else {
+                        // Solo sobreescribir si no había metadatos previos
+                        if file.metadata.title.is_none() {
+                            file.metadata.title = Some(desc.title);
+                        }
+                        if file.metadata.description.is_none() {
+                            file.metadata.description = Some(desc.description);
+                        }
+                        if file.metadata.keywords.is_empty() {
+                            file.metadata.keywords = desc.keywords;
+                        }
+                        if file.metadata.semantic_tags.is_empty() {
+                            file.metadata.semantic_tags = desc.semantic_tags;
+                        }
+                        if file.metadata.language.is_none() {
+                            file.metadata.language = desc.language;
+                        }
+                        if file.metadata.content_type_group.is_none() {
+                            file.metadata.content_type_group = desc.content_type_group;
+                        }
+                        info!(
+                            "🏷️  LLM enriquecimiento [{:?}]: keywords={:?}, tags={:?}",
+                            path.file_name().unwrap_or_default(),
+                            &file.metadata.keywords,
+                            &file.metadata.semantic_tags
+                        );
                     }
-                    if file.metadata.description.is_none() {
-                        file.metadata.description = Some(desc.description);
-                    }
-                    if file.metadata.keywords.is_empty() {
-                        file.metadata.keywords = desc.keywords;
-                    }
-                    if file.metadata.semantic_tags.is_empty() {
-                        file.metadata.semantic_tags = desc.semantic_tags;
-                    }
-                    if file.metadata.language.is_none() {
-                        file.metadata.language = desc.language;
-                    }
-                    if file.metadata.content_type_group.is_none() {
-                        file.metadata.content_type_group = desc.content_type_group;
-                    }
-                    info!(
-                        "🏷️  LLM enriquecimiento [{:?}]: keywords={:?}, tags={:?}",
-                        path.file_name().unwrap_or_default(),
-                        &file.metadata.keywords,
-                        &file.metadata.semantic_tags
-                    );
+
                     if let Some(ref desc) = file.metadata.description {
                         info!("   desc: {:?}", safe_truncate(desc, 100));
                     }
@@ -690,15 +870,28 @@ impl<'a> IndexPipeline<'a> {
         if is_image {
             parts.push(format!("Archivo: {} ({})", file.filename, clean_name));
 
-            // Repetir las palabras del nombre como keywords para reforzar
-            // Ej: "ine_frente.jpeg" → "ine frente"
-            let name_words: Vec<&str> = clean_name
-                .split_whitespace()
-                .filter(|w| w.len() > 1 && !matches!(w.to_lowercase().as_str(),
-                    "jpg" | "jpeg" | "png" | "gif" | "bmp" | "tiff" | "webp" | "svg"))
-                .collect();
-            if !name_words.is_empty() {
-                parts.push(format!("Palabras del nombre: {}", name_words.join(", ")));
+            // Inyectar keywords semánticas para imágenes.
+            // Ahora son frases/conceptos reales ("credencial INE", "identificación oficial")
+            // no tokens sueltos ("ine", "posterior", "jpeg"), así que SÍ aportan al embedding.
+            if !file.metadata.keywords.is_empty() {
+                parts.push(format!("Conceptos: {}", file.metadata.keywords.join(", ")));
+            }
+        }
+
+        // ── 0) Contexto de carpeta ─────────────────────────────────────────
+        // La ruta de carpeta aporta contexto semántico valioso:
+        // "Descargas/trabajo/" vs "Documentos/escuela/" ayuda a diferenciar.
+        if let Some(parent) = file.path.parent() {
+            let folder_str = parent.to_string_lossy();
+            // Extraer ruta relativa (sin /home/usuario/)
+            let relative = if let Some(idx) = folder_str.find("/home/") {
+                let rest = &folder_str[idx + 6..];
+                rest.find('/').map(|s| &rest[s + 1..]).unwrap_or("")
+            } else {
+                &folder_str
+            };
+            if !relative.is_empty() {
+                parts.push(format!("Carpeta: {}", relative));
             }
         }
 

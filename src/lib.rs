@@ -214,6 +214,14 @@ impl Soas {
 
     /// Escanea e indexa todas las carpetas activas
     pub async fn scan_all(&mut self) -> Result<Vec<indexer::pipeline::ScanResult>> {
+        self.scan_all_with_progress(None).await
+    }
+
+    /// Escanea e indexa todas las carpetas activas con callback de progreso.
+    pub async fn scan_all_with_progress(
+        &mut self,
+        progress_callback: Option<&dyn Fn(IndexProgress)>,
+    ) -> Result<Vec<indexer::pipeline::ScanResult>> {
         let folders = self.storage.get_watched_folders()?;
         let mut results = Vec::new();
 
@@ -221,7 +229,7 @@ impl Soas {
             if !folder.active {
                 continue;
             }
-            let result = self.scan_folder(folder).await?;
+            let result = self.scan_folder_with_progress(folder, progress_callback).await?;
             results.push(result);
         }
 
@@ -233,10 +241,19 @@ impl Soas {
         &mut self,
         folder: &WatchedFolder,
     ) -> Result<indexer::pipeline::ScanResult> {
+        self.scan_folder_with_progress(folder, None).await
+    }
+
+    /// Escanea una carpeta específica con callback de progreso.
+    pub async fn scan_folder_with_progress(
+        &mut self,
+        folder: &WatchedFolder,
+        progress_callback: Option<&dyn Fn(IndexProgress)>,
+    ) -> Result<indexer::pipeline::ScanResult> {
         let config = self.config.indexer.clone();
         let mut pipeline =
             IndexPipeline::new(&self.storage, &mut self.vector_store, &self.ollama, config);
-        pipeline.scan_folder(folder, None).await
+        pipeline.scan_folder(folder, progress_callback).await
     }
 
     /// Procesa embeddings pendientes

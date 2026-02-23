@@ -64,6 +64,12 @@ ordered-float = "4"
 # Bincode for vector serialization
 bincode = "1"
 
+# Regex for stripping thinking tokens
+regex = "1"
+
+# Interactive CLI (history + tab completion)
+rustyline = "14"
+
 [[bin]]
 name = "soas-cli"
 path = "src/bin/cli.rs"

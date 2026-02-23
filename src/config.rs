@@ -79,7 +79,7 @@ pub struct OllamaConfig {
     pub chat_model: String,
     /// Modelo de visión para OCR de documentos e imágenes con texto
     pub vision_model: String,
-    /// Modelo de visión para describir fotos e ilustraciones (qwen3-vl:4b)
+    /// Modelo de visión para describir fotos e ilustraciones (llava-phi3:3.8b)
     pub description_model: String,
     /// Timeout en segundos para las peticiones
     pub timeout_secs: u64,
@@ -95,21 +95,23 @@ impl Default for OllamaConfig {
         Self {
             base_url: "http://localhost:11434".to_string(),
             embedding_model: "nomic-embed-text".to_string(),
-            // qwen2.5:3b: mejor que llama3.2 siguiendo JSON estricto, mismo tamaño (~1.9GB)
-            chat_model: "qwen2.5:3b".to_string(),
+            // qwen3:1.7b: arquitectura Qwen3 con modo "pensante", mitad de parámetros
+            // que qwen2.5:3b pero rendimiento similar en JSON y extracción de keywords.
+            // Más rápido en CPU (~2x) y menor consumo de RAM.
+            chat_model: "qwen3:1.7b".to_string(),
             // glm-ocr: DESHABILITADO — falla consistentemente con error de red
             // en la API chat de Ollama. Se mantiene la config por si se arregla.
             vision_model: "glm-ocr".to_string(),
-            // moondream: VLM ultraligero (1.7GB) optimizado para CPU.
-            // Visual encoder más rápido que qwen3-vl:2b y no requiere GPU.
-            // qwen3-vl:2b fallaba consistentemente en CPU: timeout o vacío.
-            description_model: "moondream".to_string(),
+            // Modelo de visión ligero (3.8B), rápido y preciso en CPU.
+            // LLaVA-W (based on Phi-3) es mucho mejor que Moondream y Qwen-VL-Chat.
+            description_model: "llava-phi3:latest".to_string(),
             // 300s: inferencia en CPU para documentos largos
             timeout_secs: 300,
-            // 90s: con archivos agrupados (imágenes al final), el primer request
-            // paga la carga del modelo (~10-15s) + inferencia visual (~30-60s en CPU).
+            // 120s: con archivos agrupados (imágenes al final), el primer request
+            // paga la carga del modelo (~10-15s) + descarga del modelo anterior de RAM
+            // + inferencia visual (~30-60s en CPU).
             // Requests posteriores son más rápidos porque el modelo ya está en RAM.
-            vision_timeout_secs: 90,
+            vision_timeout_secs: 120,
             embedding_dimensions: 768, // nomic-embed-text default
         }
     }

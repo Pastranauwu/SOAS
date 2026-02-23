@@ -7,9 +7,14 @@ use tracing::{debug, info, warn};
 
 /// Resolución máxima (ancho o alto) antes de enviar a OCR.
 /// Imágenes más grandes se redimensionan para acelerar la inferencia en CPU.
-/// 640px prioriza velocidad en CPU, manteniendo suficiente detalle para
+/// 512px prioriza aún más velocidad en CPU, manteniendo suficiente detalle para
 /// descripciones visuales útiles y extracción de texto corto.
-const MAX_OCR_DIMENSION: u32 = 640;
+const MAX_OCR_DIMENSION: u32 = 512;
+
+/// Calidad JPEG al recodificar (no se usa si se cambia a PNG).
+/// Mantenida como referencia, pero el pipeline actual usa PNG (lossless).
+#[allow(dead_code)]
+const JPEG_QUALITY: u8 = 90;
 
 /// Prepara una imagen para OCR: la redimensiona si es muy grande y la codifica en base64.
 /// Esto reduce drásticamente el tiempo de inferencia en CPU (3-10x para fotos grandes).
@@ -31,15 +36,19 @@ fn prepare_image_base64(path: &Path) -> Result<String> {
         img.resize(
             MAX_OCR_DIMENSION,
             MAX_OCR_DIMENSION,
-            image::imageops::FilterType::Triangle, // bilinear — rápido y buena calidad
+            // Lanczos3 preserva mejor los bordes del texto que Triangle (bilinear)
+            // sin coste extra apreciable en CPU para imágenes <2 MP.
+            image::imageops::FilterType::Lanczos3,
         )
     } else {
         img
     };
 
-    // Codificar como JPEG (más compacto que PNG para el transporte)
+    // Codificar como PNG (lossless): preserva bordes de texto sin artefactos JPEG.
+    // La compresión JPEG a 512px degrada las letras delgadas, haciendo que el VLM
+    // lea caracteres incorrectos. PNG es más grande pero local → sin impacto en tiempo.
     let mut buf = std::io::Cursor::new(Vec::new());
-    img.write_to(&mut buf, image::ImageFormat::Jpeg)
+    img.write_to(&mut buf, image::ImageFormat::Png)
         .map_err(|e| {
             crate::error::SoasError::ContentExtraction(format!(
                 "Error codificando imagen: {}", e
@@ -48,7 +57,7 @@ fn prepare_image_base64(path: &Path) -> Result<String> {
 
     let encoded = base64::engine::general_purpose::STANDARD.encode(buf.into_inner());
     debug!(
-        "Imagen preparada: {}x{} → base64 {} KB",
+        "Imagen preparada: {}x{} → PNG base64 {} KB",
         img.width(),
         img.height(),
         encoded.len() / 1024
@@ -76,13 +85,143 @@ fn build_filename_fallback_summary(path: &Path) -> String {
         .map(|e| e.to_string_lossy().to_lowercase())
         .unwrap_or_else(|| "img".to_string());
 
-    format!(
-        "Resumen visual (fallback): archivo de imagen \"{}\" ({}). Nombre semántico: {}.",
-        filename, ext, clean_name
-    )
+    // Generar una descripción semántica más rica a partir del nombre.
+    // Los nombres de archivo suelen ser bastante descriptivos:
+    // "ine_frente.jpeg" → "Imagen: ine frente. Podría ser credencial INE (frente).
+    // Esto ayuda al embedding a capturar la intención de búsqueda.
+    let semantic_hint = infer_semantic_hint_from_name(&clean_name);
+
+    if semantic_hint.is_empty() {
+        format!(
+            "Imagen: {}. Archivo de imagen {} ({}).",
+            clean_name, filename, ext
+        )
+    } else {
+        format!(
+            "Imagen: {}. {}. Archivo {} ({}).",
+            clean_name, semantic_hint, filename, ext
+        )
+    }
 }
 
-/// Extrae un resumen visual de imágenes usando qwen3-vl.
+fn build_filename_fallback_summary_with_hint(path: &Path, hint: &str) -> String {
+    let base = build_filename_fallback_summary(path);
+    if hint.trim().is_empty() {
+        return base;
+    }
+
+    format!("{} Pista visual: {}.", base.trim_end_matches('.'), hint.trim())
+}
+
+fn extract_structured_visual_hint(text: &str) -> Option<String> {
+    let cleaned = text.trim().replace('\r', "");
+    if cleaned.is_empty() {
+        return None;
+    }
+
+    let mut parts = Vec::new();
+    for line in cleaned.lines().map(|l| l.trim()).filter(|l| !l.is_empty()) {
+        let lower = line.to_lowercase();
+        let is_structured = lower.starts_with("tema:") || lower.starts_with("texto visible:");
+        if !is_structured {
+            continue;
+        }
+
+        let payload = line
+            .split_once(':')
+            .map(|(_, right)| right.trim())
+            .unwrap_or("");
+        let payload_lower = payload.to_lowercase();
+
+        let is_template_echo = payload_lower.is_empty()
+            || payload.contains('[')
+            || payload.contains(']')
+            || payload.contains('|')
+            || payload.contains('+')
+            || payload_lower.contains("si/no")
+            || payload_lower.contains("resumen corto")
+            || payload_lower.contains("frase corta")
+            || payload_lower.contains("documento") && payload_lower.contains("foto")
+            || payload_lower.contains("captura") && payload_lower.contains("gráfico")
+            || payload.len() < 6;
+
+        if is_template_echo {
+            continue;
+        }
+
+        parts.push(format!("{}: {}", line.split_once(':').map(|(k, _)| k.trim()).unwrap_or("Dato"), payload));
+    }
+
+    if parts.is_empty() {
+        let lower = cleaned.to_lowercase();
+        if lower.starts_with("tema:") || lower.starts_with("texto visible:") {
+            return Some(cleaned.to_string());
+        }
+        return None;
+    }
+
+    Some(parts.join(" | "))
+}
+
+/// Infiere una pista semántica del nombre de archivo para mejorar el embedding.
+/// Reconoce patrones comunes en nombres de archivos de usuario.
+fn infer_semantic_hint_from_name(clean_name: &str) -> String {
+    let lower = clean_name.to_lowercase();
+    let mut hints = Vec::new();
+
+    // Documentos de identidad
+    if lower.contains("ine") || lower.contains("credencial") || lower.contains("identificacion") {
+        hints.push("credencial de identificación INE");
+    }
+    if lower.contains("pasaporte") {
+        hints.push("documento de pasaporte");
+    }
+    if lower.contains("curp") {
+        hints.push("documento CURP");
+    }
+    if lower.contains("rfc") {
+        hints.push("documento RFC");
+    }
+    if lower.contains("licencia") {
+        hints.push("licencia de conducir");
+    }
+    if lower.contains("acta") && lower.contains("nacimiento") {
+        hints.push("acta de nacimiento");
+    }
+
+    // Orientación de la imagen
+    if lower.contains("frente") || lower.contains("frontal") || lower.contains("front") {
+        hints.push("vista frontal");
+    }
+    if lower.contains("posterior") || lower.contains("atras") || lower.contains("reverso") || lower.contains("back") {
+        hints.push("vista posterior/reverso");
+    }
+
+    // Fotos personales
+    if lower.contains("foto") || lower.contains("selfie") || lower.contains("retrato") {
+        hints.push("fotografía personal");
+    }
+    if lower.contains("recibo") || lower.contains("comprobante") {
+        hints.push("recibo o comprobante");
+    }
+    if lower.contains("factura") {
+        hints.push("factura");
+    }
+    if lower.contains("constancia") {
+        hints.push("constancia o certificado");
+    }
+    if lower.contains("diploma") || lower.contains("titulo") || lower.contains("certificado") {
+        hints.push("diploma o certificado");
+    }
+
+    if hints.is_empty() {
+        String::new()
+    } else {
+        format!("Posible contenido: {}", hints.join(", "))
+    }
+}
+
+/// Extrae un resumen visual de imágenes usando modelos VLM ligeros (phi-3/qwen).
 ///
 /// En CPU se evita OCR como paso separado para no duplicar inferencia.
 /// En su lugar se realiza una sola llamada que pide:
@@ -98,18 +237,50 @@ pub async fn extract(path: &Path, ollama: &OllamaClient) -> Result<ExtractedCont
 
     let text;
     let method;
+    let mut vision_hint: Option<String> = None;
 
     info!("   → Paso único: resumen visual con modelo de visión...");
     let start = std::time::Instant::now();
 
-    // Prompt simple y directo: moondream funciona mejor con instrucciones cortas.
-    // qwen3-vl también responde bien a prompts concisos.
-    // Evitar formatos complejos que modelos ligeros no siguen en CPU.
-    let summary_prompt = "Describe this image in Spanish. Include: what it shows, \
-                          main elements, and any visible text. Be concise, 2-3 sentences.";
+    // Prompt más natural para evitar que el modelo repita la plantilla como un loro.
+    let summary_prompt = "Describe esta imagen en español brevemente.\n\
+        1. Indica qué tipo de imagen es (foto, documento, captura, etc).\n\
+        2. Si hay texto legible importante, escribe 'Texto visible: ' y el contenido.\n\
+        3. Escribe 'Tema: ' seguido de una frase resumen.\n\
+        Sé directo. No uses bloques de pensamiento (<think>).";
 
-    match ollama.describe_photo(&image_base64, summary_prompt).await {
-        Ok(desc) if !desc.trim().is_empty() => {
+    // ── Retry con backoff para tolerancia a fallos transitorios ──────────
+    // La primera imagen puede fallar por carga del modelo en RAM.
+    // Reintentar 1 vez con pausa permite que Ollama termine la carga.
+    let max_retries = 1;
+    let mut last_error: Option<String> = None;
+    let mut vision_result = None;
+
+    for attempt in 0..=max_retries {
+        if attempt > 0 {
+            info!("   🔄 Reintentando visión (intento {}/{}), esperando 3s para carga de modelo...",
+                  attempt + 1, max_retries + 1);
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        }
+
+        match ollama.describe_photo(&image_base64, summary_prompt).await {
+            Ok(desc) => {
+                vision_result = Some(desc);
+                break;
+            }
+            Err(e) => {
+                let elapsed = start.elapsed();
+                warn!(
+                    "   ⚠️  Intento {} falló en {:.1}s: {}",
+                    attempt + 1, elapsed.as_secs_f64(), e
+                );
+                last_error = Some(e.to_string());
+            }
+        }
+    }
+
+    match vision_result {
+        Some(desc) if !desc.trim().is_empty() => {
             // Limpiar artefactos comunes de moondream: "!!!" prefijo
             let trimmed = desc.trim().trim_start_matches('!').trim().to_string();
             let elapsed = start.elapsed();
@@ -119,8 +290,14 @@ pub async fn extract(path: &Path, ollama: &OllamaClient) -> Result<ExtractedCont
                     "   ⚠️  Resumen visual basura en {:.1}s, usando fallback por nombre",
                     elapsed.as_secs_f64()
                 );
-                text = build_filename_fallback_summary(path);
-                method = "qwen3vl-fallback-garbage";
+                if let Some(hint) = extract_structured_visual_hint(&trimmed) {
+                    vision_hint = Some(hint.clone());
+                    text = build_filename_fallback_summary_with_hint(path, &hint);
+                    method = "vision-fallback-hint";
+                } else {
+                    text = build_filename_fallback_summary(path);
+                    method = "vision-fallback-garbage";
+                }
             } else {
                 let preview = &trimmed[..trimmed.len().min(150)];
                 info!(
@@ -128,26 +305,26 @@ pub async fn extract(path: &Path, ollama: &OllamaClient) -> Result<ExtractedCont
                     trimmed.len(), elapsed.as_secs_f64(), preview
                 );
                 text = trimmed;
-                method = "qwen3vl-summary";
+                method = "vision-summary";
             }
         }
-        Ok(_) => {
+        Some(_) => {
             let elapsed = start.elapsed();
             info!(
                 "   ⚠️  Resumen visual vacío en {:.1}s, usando fallback por nombre",
                 elapsed.as_secs_f64()
             );
             text = build_filename_fallback_summary(path);
-            method = "qwen3vl-fallback-empty";
+            method = "vision-fallback-empty";
         }
-        Err(e) => {
+        None => {
             let elapsed = start.elapsed();
             info!(
                 "   ❌ Resumen visual falló en {:.1}s: {}. Usando fallback por nombre",
-                elapsed.as_secs_f64(), e
+                elapsed.as_secs_f64(), last_error.as_deref().unwrap_or("unknown")
             );
             text = build_filename_fallback_summary(path);
-            method = "qwen3vl-fallback-error";
+            method = "vision-fallback-error";
         }
     }
 
@@ -160,6 +337,9 @@ pub async fn extract(path: &Path, ollama: &OllamaClient) -> Result<ExtractedCont
     extra.insert("type".to_string(), "image".to_string());
     extra.insert("ocr".to_string(), method.to_string());
     extra.insert("vision".to_string(), method.to_string());
+    if let Some(hint) = vision_hint {
+        extra.insert("vision_hint".to_string(), hint);
+    }
 
     Ok(ExtractedContent {
         text,
@@ -178,9 +358,45 @@ pub async fn extract(path: &Path, ollama: &OllamaClient) -> Result<ExtractedCont
 /// Estas salidas contaminan los embeddings y deben descartarse.
 fn is_garbage_vision_output(text: &str) -> bool {
     let t = text.trim();
+    let lower = t.to_lowercase();
 
-    // Demasiado corto para ser una descripción útil
-    if t.len() < 15 {
+    // Permitir respuestas estructuradas cortas si aportan semántica real.
+    // Ej: "Tema: niña en bosque con luces azules"
+    let has_structured_hint = lower.starts_with("tema:")
+        || lower.starts_with("texto visible:")
+        || (lower.contains("tema:") && lower.contains("texto visible:"));
+    let has_template_echo = lower.contains("[")
+        || lower.contains("]")
+        || lower.contains("si/no + resumen corto")
+        || lower.contains("documento|foto|captura")
+        || lower.contains("1 frase corta")
+        || lower.contains("texto visible: si/no")
+        || lower.contains("tema: frase corta");
+    if has_structured_hint && !has_template_echo && t.len() >= 20 {
+        return false;
+    }
+
+    // Demasiado corto para ser una descripción útil.
+    // Descripciones reales de moondream son 60-80+ chars.
+    // "lloros de cuatro 10142019 h." (28 chars) es basura que escape el límite de 15.
+    if t.len() < 40 {
+        return true;
+    }
+
+    // Texto de planificación interno (thinking) recuperado por fallback:
+    // no describe la imagen, solo instrucciones/meta-razonamiento.
+    let meta_markers = [
+        "let me",
+        "i need",
+        "the user",
+        "wait,",
+        "include: what it shows",
+        "main elements",
+        "visible text",
+        "possible translation",
+        "final answer",
+    ];
+    if meta_markers.iter().any(|m| lower.contains(m)) {
         return true;
     }
 
@@ -201,6 +417,24 @@ fn is_garbage_vision_output(text: &str) -> bool {
         let unique: std::collections::HashSet<char> = second_half.chars().collect();
         if unique.len() <= 4 {
             return true;
+        }
+    }
+
+    // ── Detección de palabras repetitivas ──────────────────────────────
+    // moondream genera "Lol!!! Lol!!! Lol!!!" o "superiora superiora superiora"
+    // que son largas y latinas pero no descripciones útiles.
+    // Si la diversidad de palabras es muy baja (< 30%), es basura repetitiva.
+    {
+        let words: Vec<&str> = t.split_whitespace().collect();
+        if words.len() >= 6 {
+            let unique_words: std::collections::HashSet<&str> = words.iter()
+                .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()))
+                .filter(|w| !w.is_empty())
+                .collect();
+            let diversity = unique_words.len() as f32 / words.len() as f32;
+            if diversity < 0.30 {
+                return true;
+            }
         }
     }
 
@@ -232,7 +466,7 @@ fn is_garbage_vision_output(text: &str) -> bool {
 
     // ── Detección de "!!!" prefijo ── moondream a veces antepone "!!!" a su salida
     let clean = t.trim_start_matches('!').trim();
-    if clean.len() < 15 {
+    if clean.len() < 40 {
         return true;
     }
 
