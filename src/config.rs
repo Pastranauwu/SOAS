@@ -77,14 +77,16 @@ pub struct OllamaConfig {
     pub embedding_model: String,
     /// Modelo de chat para consultas y clasificación
     pub chat_model: String,
-    /// Modelo de visión para OCR de documentos e imágenes con texto
+    /// Modelo de visión para describir imágenes (llava-phi3)
     pub vision_model: String,
-    /// Modelo de visión para describir fotos e ilustraciones (llava-phi3:3.8b)
+    /// Legacy: se mantiene por compatibilidad con configs existentes.
+    /// Ya no se usa en el código — solo vision_model.
+    #[serde(default)]
     pub description_model: String,
     /// Timeout en segundos para las peticiones
     pub timeout_secs: u64,
-    /// Timeout específico para modelos de visión (OCR/descripción de imágenes).
-    /// Más corto que el general para no bloquear ~5 min si el modelo no responde.
+    /// Timeout específico para modelos de visión.
+    /// Más corto que el general para no bloquear si el modelo no responde.
     pub vision_timeout_secs: u64,
     /// Dimensión del vector de embedding (depende del modelo)
     pub embedding_dimensions: usize,
@@ -95,21 +97,14 @@ impl Default for OllamaConfig {
         Self {
             base_url: "http://localhost:11434".to_string(),
             embedding_model: "nomic-embed-text".to_string(),
-            // qwen3:1.7b: arquitectura Qwen3 con modo "pensante", mitad de parámetros
-            // que qwen2.5:3b pero rendimiento similar en JSON y extracción de keywords.
-            // Más rápido en CPU (~2x) y menor consumo de RAM.
+            // qwen3:1.7b: rápido en CPU, buen rendimiento en JSON y clasificación.
             chat_model: "qwen3:1.7b".to_string(),
-            // glm-ocr: DESHABILITADO — falla consistentemente con error de red
-            // en la API chat de Ollama. Se mantiene la config por si se arregla.
-            vision_model: "glm-ocr".to_string(),
-            // Modelo de visión ligero (3.8B), rápido y preciso en CPU.
-            // LLaVA-W (based on Phi-3) es mucho mejor que Moondream y Qwen-VL-Chat.
+            // llava-phi3: modelo de visión ligero (3.8B), rápido y preciso en CPU.
+            vision_model: "llava-phi3:latest".to_string(),
             description_model: "llava-phi3:latest".to_string(),
             // 300s: inferencia en CPU para documentos largos
             timeout_secs: 300,
-            // 120s: con archivos agrupados (imágenes al final), el primer request
-            // paga la carga del modelo (~10-15s) + descarga del modelo anterior de RAM
-            // + inferencia visual (~30-60s en CPU).
+            // 120s: el primer request paga la carga del modelo (~10-15s).
             // Requests posteriores son más rápidos porque el modelo ya está en RAM.
             vision_timeout_secs: 120,
             embedding_dimensions: 768, // nomic-embed-text default

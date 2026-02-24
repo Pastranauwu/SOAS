@@ -121,6 +121,10 @@ pub struct FileMetadata {
     pub author: Option<String>,
     /// Descripción o resumen generado por LLM
     pub description: Option<String>,
+    /// Resumen corto para mostrar en la UI sin abrir el archivo.
+    /// 1-3 oraciones que permiten al usuario decidir si es el archivo que busca.
+    #[serde(default)]
+    pub summary: Option<String>,
     /// Palabras clave extraídas
     pub keywords: Vec<String>,
     /// Etiquetas semánticas generadas por LLM (temas, entidades, conceptos)

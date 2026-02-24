@@ -179,19 +179,28 @@ impl Completer for CliHelper {
 }
 
 fn detect_default_scan_path() -> Option<String> {
-    let home = std::env::var("HOME").ok()?;
-    let candidates = ["Descargas", "Downloads", "Documentos", "Documents"];
-
-    for folder in candidates {
-        let candidate = Path::new(&home).join(folder);
-        if candidate.exists() && candidate.is_dir() {
-            return Some(candidate.to_string_lossy().to_string());
+    // Prioridad: carpeta de Descargas nativa → Documentos → Home
+    // `dirs` resuelve automáticamente la ruta correcta según el SO:
+    //   Linux  → $HOME/Descargas  o  $HOME/Downloads
+    //   Windows → C:\Users\<user>\Downloads
+    //   macOS  → /Users/<user>/Downloads
+    if let Some(downloads) = dirs::download_dir() {
+        if downloads.exists() && downloads.is_dir() {
+            return Some(downloads.to_string_lossy().to_string());
         }
     }
 
-    let home_path = Path::new(&home);
-    if home_path.exists() && home_path.is_dir() {
-        return Some(home_path.to_string_lossy().to_string());
+    if let Some(documents) = dirs::document_dir() {
+        if documents.exists() && documents.is_dir() {
+            return Some(documents.to_string_lossy().to_string());
+        }
+    }
+
+    // Último recurso: home del usuario
+    if let Some(home) = dirs::home_dir() {
+        if home.exists() && home.is_dir() {
+            return Some(home.to_string_lossy().to_string());
+        }
     }
 
     None
@@ -724,6 +733,9 @@ async fn main() -> anyhow::Result<()> {
                     if let Some(ref desc) = f.metadata.description {
                         println!("   ║ Descripción: {}", desc);
                     }
+                    if let Some(ref summary) = f.metadata.summary {
+                        println!("   ║ Resumen:   {}", summary);
+                    }
                     if !f.metadata.keywords.is_empty() {
                         println!("   ║ Keywords:  {}", f.metadata.keywords.join(", "));
                     }
@@ -817,10 +829,17 @@ async fn main() -> anyhow::Result<()> {
                             virtual_name,
                         );
 
-                        if !r.snippet.is_empty() {
-                            let snippet: String = r.snippet.chars().take(120).collect();
-                            let snippet = snippet.replace('\n', " ");
-                            println!("      └─ {}", snippet.trim());
+                        // Mostrar summary o snippet como preview del contenido
+                        let preview_text = r.file.metadata.summary.as_deref()
+                            .filter(|s| !s.is_empty())
+                            .or_else(|| {
+                                if !r.snippet.is_empty() { Some(r.snippet.as_str()) } else { None }
+                            });
+
+                        if let Some(text) = preview_text {
+                            let preview: String = text.chars().take(140).collect();
+                            let preview = preview.replace('\n', " ");
+                            println!("      └─ {}", preview.trim());
                         }
                     }
                 }

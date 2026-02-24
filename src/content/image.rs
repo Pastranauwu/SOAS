@@ -5,19 +5,85 @@ use base64::Engine;
 use std::path::Path;
 use tracing::{debug, info, warn};
 
-/// Resolución máxima (ancho o alto) antes de enviar a OCR.
-/// Imágenes más grandes se redimensionan para acelerar la inferencia en CPU.
-/// 512px prioriza aún más velocidad en CPU, manteniendo suficiente detalle para
-/// descripciones visuales útiles y extracción de texto corto.
-const MAX_OCR_DIMENSION: u32 = 512;
+/// Limpia la salida del VLM eliminando frases de plantilla que contaminan
+/// keywords y embeddings. Estas frases aparecen en casi toda imagen y
+/// no aportan información semántica diferenciadora.
+fn clean_vision_output(raw: &str) -> String {
+    let mut lines: Vec<&str> = Vec::new();
 
-/// Calidad JPEG al recodificar (no se usa si se cambia a PNG).
-/// Mantenida como referencia, pero el pipeline actual usa PNG (lossless).
-#[allow(dead_code)]
-const JPEG_QUALITY: u8 = 90;
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
 
-/// Prepara una imagen para OCR: la redimensiona si es muy grande y la codifica en base64.
-/// Esto reduce drásticamente el tiempo de inferencia en CPU (3-10x para fotos grandes).
+        // Quitar numeración de lista: "1. ", "2. ", "3. "
+        let stripped = if trimmed.len() > 3
+            && trimmed.as_bytes()[0].is_ascii_digit()
+            && trimmed.as_bytes()[1] == b'.'
+            && trimmed.as_bytes()[2] == b' '
+        {
+            &trimmed[3..]
+        } else {
+            trimmed
+        };
+
+        let lower = stripped.to_lowercase();
+
+        // Descartar frases de plantilla vacías de contenido
+        let is_template = lower.contains("no hay texto legible")
+            || lower.contains("no hay texto visible")
+            || lower.contains("no se puede leer")
+            || lower.contains("no contiene texto")
+            || lower.starts_with("esta es una imagen en formato")
+            || lower.starts_with("la imagen es una fotografía")
+            || lower.starts_with("esta es una imagen de formato")
+            || (lower.starts_with("la imagen es un") && lower.len() < 40);
+
+        if is_template {
+            continue;
+        }
+
+        // Quitar prefijos redundantes tipo "Tema: ", "Texto visible: "
+        // Mantener el contenido después del prefijo
+        let content = if let Some(after) = lower.strip_prefix("tema: ") {
+            let _ = after; // solo para que compile
+            stripped.splitn(2, ':').nth(1).map(|s| s.trim()).unwrap_or(stripped)
+        } else if let Some(after) = lower.strip_prefix("texto visible: ") {
+            let _ = after;
+            stripped.splitn(2, ':').nth(1).map(|s| s.trim()).unwrap_or(stripped)
+        } else {
+            stripped
+        };
+
+        if !content.is_empty() {
+            lines.push(content);
+        }
+    }
+
+    let result = lines.join(". ");
+    // Si quedó vacío después de limpiar, devolver el raw original
+    if result.trim().is_empty() {
+        raw.trim().to_string()
+    } else {
+        result
+    }
+}
+
+/// Resolución máxima para enviar al VLM.
+///
+/// Lección aprendida: llava-phi3 (~3.8B params) NO puede hacer OCR real.
+/// A 1280px tarda 100s+ y sigue alucinando ("CURP argentino" para una INE).
+/// A 512px no alcanza a ver detalles para clasificar correctamente.
+///
+/// Punto óptimo: 768px
+///   - Suficiente para que el VLM clasifique (documento vs foto vs screenshot)
+///   - Suficiente para describir contenido visual general
+///   - ~15-40s por imagen (aceptable para indexación batch)
+///   - NO confiar en transcripción de texto (usar filename para eso)
+const MAX_VLM_DIMENSION: u32 = 768;
+
+/// Prepara una imagen para el VLM: redimensiona a max 768px y codifica en base64.
 fn prepare_image_base64(path: &Path) -> Result<String> {
     let img = image::open(path).map_err(|e| {
         crate::error::SoasError::ContentExtraction(format!(
@@ -28,25 +94,21 @@ fn prepare_image_base64(path: &Path) -> Result<String> {
 
     let (w, h) = (img.width(), img.height());
 
-    let img = if w > MAX_OCR_DIMENSION || h > MAX_OCR_DIMENSION {
+    let img = if w > MAX_VLM_DIMENSION || h > MAX_VLM_DIMENSION {
         debug!(
             "Redimensionando imagen {}x{} → max {}px: {:?}",
-            w, h, MAX_OCR_DIMENSION, path.file_name()
+            w, h, MAX_VLM_DIMENSION, path.file_name()
         );
         img.resize(
-            MAX_OCR_DIMENSION,
-            MAX_OCR_DIMENSION,
-            // Lanczos3 preserva mejor los bordes del texto que Triangle (bilinear)
-            // sin coste extra apreciable en CPU para imágenes <2 MP.
+            MAX_VLM_DIMENSION,
+            MAX_VLM_DIMENSION,
             image::imageops::FilterType::Lanczos3,
         )
     } else {
         img
     };
 
-    // Codificar como PNG (lossless): preserva bordes de texto sin artefactos JPEG.
-    // La compresión JPEG a 512px degrada las letras delgadas, haciendo que el VLM
-    // lea caracteres incorrectos. PNG es más grande pero local → sin impacto en tiempo.
+    // PNG lossless: preserva bordes mejor que JPEG a resolución reducida.
     let mut buf = std::io::Cursor::new(Vec::new());
     img.write_to(&mut buf, image::ImageFormat::Png)
         .map_err(|e| {
@@ -56,10 +118,10 @@ fn prepare_image_base64(path: &Path) -> Result<String> {
         })?;
 
     let encoded = base64::engine::general_purpose::STANDARD.encode(buf.into_inner());
-    debug!(
-        "Imagen preparada: {}x{} → PNG base64 {} KB",
-        img.width(),
-        img.height(),
+    info!(
+        "   📐 Imagen: {}x{} → {}x{} PNG {} KB",
+        w, h,
+        img.width(), img.height(),
         encoded.len() / 1024
     );
     Ok(encoded)
@@ -242,12 +304,14 @@ pub async fn extract(path: &Path, ollama: &OllamaClient) -> Result<ExtractedCont
     info!("   → Paso único: resumen visual con modelo de visión...");
     let start = std::time::Instant::now();
 
-    // Prompt más natural para evitar que el modelo repita la plantilla como un loro.
-    let summary_prompt = "Describe esta imagen en español brevemente.\n\
-        1. Indica qué tipo de imagen es (foto, documento, captura, etc).\n\
-        2. Si hay texto legible importante, escribe 'Texto visible: ' y el contenido.\n\
-        3. Escribe 'Tema: ' seguido de una frase resumen.\n\
-        Sé directo. No uses bloques de pensamiento (<think>).";
+    // Prompt SIMPLE y directo. Lección aprendida:
+    // - llava-phi3 NO puede hacer OCR (alucina texto inexistente)
+    // - Pedir transcripción produce peores resultados que pedir descripción
+    // - El nombre del archivo es MÁS confiable que el VLM para identificar docs
+    // - El VLM solo aporta: clasificación visual + descripción de contenido
+    let summary_prompt = "Describe esta imagen en español en 2-3 oraciones. \
+        ¿Qué tipo de imagen es? ¿Qué muestra? \
+        Si parece un documento oficial, di de qué tipo parece ser.";
 
     // ── Retry con backoff para tolerancia a fallos transitorios ──────────
     // La primera imagen puede fallar por carga del modelo en RAM.
@@ -281,8 +345,9 @@ pub async fn extract(path: &Path, ollama: &OllamaClient) -> Result<ExtractedCont
 
     match vision_result {
         Some(desc) if !desc.trim().is_empty() => {
-            // Limpiar artefactos comunes de moondream: "!!!" prefijo
-            let trimmed = desc.trim().trim_start_matches('!').trim().to_string();
+            // Limpiar artefactos de VLMs ("!!!" prefijo) + frases de plantilla
+            let raw_trimmed = desc.trim().trim_start_matches('!').trim();
+            let trimmed = clean_vision_output(raw_trimmed);
             let elapsed = start.elapsed();
 
             if trimmed.is_empty() || is_garbage_vision_output(&trimmed) {
@@ -299,7 +364,15 @@ pub async fn extract(path: &Path, ollama: &OllamaClient) -> Result<ExtractedCont
                     method = "vision-fallback-garbage";
                 }
             } else {
-                let preview = &trimmed[..trimmed.len().min(150)];
+                // safe_preview: corte en frontera de char UTF-8
+                let end = {
+                    let mut e = trimmed.len().min(150);
+                    while e > 0 && !trimmed.is_char_boundary(e) {
+                        e -= 1;
+                    }
+                    e
+                };
+                let preview = &trimmed[..end];
                 info!(
                     "   ✅ Resumen visual: {} chars en {:.1}s — {:?}",
                     trimmed.len(), elapsed.as_secs_f64(), preview
@@ -352,39 +425,32 @@ pub async fn extract(path: &Path, ollama: &OllamaClient) -> Result<ExtractedCont
 
 /// Detecta salidas basura de VLMs que no son descripciones útiles.
 ///
-/// Algunos modelos de visión (especialmente moondream) producen coordenadas
-/// de bounding boxes, texto ultra-corto, secuencias repetitivas, o
-/// alucinaciones en scripts no-latinos (tailandés, árabe, chino basura).
-/// Estas salidas contaminan los embeddings y deben descartarse.
+/// Algunos modelos de visión producen coordenadas de bounding boxes,
+/// texto ultra-corto, secuencias repetitivas, o alucinaciones en
+/// scripts no-latinos. Estas salidas contaminan los embeddings.
 fn is_garbage_vision_output(text: &str) -> bool {
     let t = text.trim();
     let lower = t.to_lowercase();
 
-    // Permitir respuestas estructuradas cortas si aportan semántica real.
-    // Ej: "Tema: niña en bosque con luces azules"
-    let has_structured_hint = lower.starts_with("tema:")
-        || lower.starts_with("texto visible:")
-        || (lower.contains("tema:") && lower.contains("texto visible:"));
+    // Detectar eco de plantilla: el VLM copió las instrucciones del prompt
     let has_template_echo = lower.contains("[")
         || lower.contains("]")
         || lower.contains("si/no + resumen corto")
         || lower.contains("documento|foto|captura")
         || lower.contains("1 frase corta")
         || lower.contains("texto visible: si/no")
-        || lower.contains("tema: frase corta");
-    if has_structured_hint && !has_template_echo && t.len() >= 20 {
-        return false;
+        || lower.contains("tema: frase corta")
+        || lower.contains("2-3 oraciones");
+    if has_template_echo {
+        return true;
     }
 
     // Demasiado corto para ser una descripción útil.
-    // Descripciones reales de moondream son 60-80+ chars.
-    // "lloros de cuatro 10142019 h." (28 chars) es basura que escape el límite de 15.
     if t.len() < 40 {
         return true;
     }
 
-    // Texto de planificación interno (thinking) recuperado por fallback:
-    // no describe la imagen, solo instrucciones/meta-razonamiento.
+    // Meta-razonamiento interno del LLM: no describe la imagen.
     let meta_markers = [
         "let me",
         "i need",
@@ -421,9 +487,8 @@ fn is_garbage_vision_output(text: &str) -> bool {
     }
 
     // ── Detección de palabras repetitivas ──────────────────────────────
-    // moondream genera "Lol!!! Lol!!! Lol!!!" o "superiora superiora superiora"
-    // que son largas y latinas pero no descripciones útiles.
-    // Si la diversidad de palabras es muy baja (< 30%), es basura repetitiva.
+    // VLMs pueden generar secuencias repetitivas que parecen texto válido.
+    // Si la diversidad de palabras es muy baja (< 30%), es basura.
     {
         let words: Vec<&str> = t.split_whitespace().collect();
         if words.len() >= 6 {
@@ -439,10 +504,8 @@ fn is_garbage_vision_output(text: &str) -> bool {
     }
 
     // ── Detección de alucinación Unicode ──────────────────────────────────
-    // Moondream a veces genera texto en scripts aleatorios (tailandés, árabe,
-    // CJK basura) cuando no puede interpretar la imagen. El contenido real de
-    // archivos en computadoras personales está casi siempre en latín o cirílico.
-    // Si más del 40% de los caracteres son non-Latin, es alucinación.
+    // VLMs pueden generar texto en scripts aleatorios cuando no pueden
+    // interpretar la imagen. Si más del 40% son non-Latin, es alucinación.
     let total_chars = t.chars().count();
     if total_chars > 0 {
         let non_latin = t.chars().filter(|c| {
@@ -464,7 +527,7 @@ fn is_garbage_vision_output(text: &str) -> bool {
         }
     }
 
-    // ── Detección de "!!!" prefijo ── moondream a veces antepone "!!!" a su salida
+    // ── Detección de "!!!" prefijo ── algunos VLMs anteponen "!!!" a su salida
     let clean = t.trim_start_matches('!').trim();
     if clean.len() < 40 {
         return true;

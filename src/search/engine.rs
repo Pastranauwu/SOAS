@@ -428,6 +428,9 @@ impl<'a> SearchEngine<'a> {
         // ── 7.5 Re-ranking por señales de "recuerdo" en lenguaje natural ──
         combined = Self::apply_memory_recall_boost(combined, &query.text);
 
+        // ── 7.6 Bonus por coincidencia de fecha mencionada en la query ──
+        combined = Self::apply_date_boost(combined, &query.text);
+
         // ── 8. Cortar por brecha de relevancia ────────────────────────────────
         combined = Self::cut_at_relevance_gap(combined);
 
@@ -440,6 +443,67 @@ impl<'a> SearchEngine<'a> {
 
         info!("Búsqueda completada: {} resultados en {:.1}s", combined.len(), search_start.elapsed().as_secs_f64());
         Ok(combined)
+    }
+
+    /// Bonus de score cuando la query menciona un año y el archivo coincide.
+    /// Ej: "archivo de 2019" → archivos creados/modificados en 2019 reciben boost.
+    fn apply_date_boost(mut results: Vec<SearchResult>, query_text: &str) -> Vec<SearchResult> {
+        if results.is_empty() {
+            return results;
+        }
+
+        // Extraer años de 4 dígitos de la query (2000-2099)
+        let mut years: Vec<i32> = Vec::new();
+        for word in query_text.split(|c: char| !c.is_ascii_digit()) {
+            if word.len() == 4 {
+                if let Ok(y) = word.parse::<i32>() {
+                    if (2000..=2099).contains(&y) {
+                        years.push(y);
+                    }
+                }
+            }
+        }
+
+        // Extraer meses en español de la query
+        let lower = query_text.to_lowercase();
+        let month_map = [
+            ("enero", 1u32), ("febrero", 2), ("marzo", 3), ("abril", 4),
+            ("mayo", 5), ("junio", 6), ("julio", 7), ("agosto", 8),
+            ("septiembre", 9), ("octubre", 10), ("noviembre", 11), ("diciembre", 12),
+        ];
+        let months: Vec<u32> = month_map.iter()
+            .filter(|(name, _)| lower.contains(name))
+            .map(|(_, num)| *num)
+            .collect();
+
+        if years.is_empty() && months.is_empty() {
+            return results;
+        }
+
+        for r in &mut results {
+            let mut bonus: f32 = 0.0;
+
+            // Check both created_at and modified_at
+            let dates = [r.file.created_at, r.file.modified_at];
+            for dt in &dates {
+                let file_year = dt.format("%Y").to_string().parse::<i32>().unwrap_or(0);
+                let file_month = dt.format("%m").to_string().parse::<u32>().unwrap_or(0);
+
+                if years.contains(&file_year) {
+                    bonus = bonus.max(0.06);
+                    if months.contains(&file_month) {
+                        bonus = bonus.max(0.10); // año + mes = match fuerte
+                    }
+                }
+            }
+
+            if bonus > 0.0 {
+                r.score = (r.score + bonus).min(1.0);
+            }
+        }
+
+        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        results
     }
 
     /// Detecta la brecha más grande de relevancia entre resultados consecutivos

@@ -373,11 +373,6 @@ impl Soas {
     pub async fn reindex_images(&mut self) -> Result<Vec<indexer::pipeline::ScanResult>> {
         tracing::info!("Iniciando re-indexación de imágenes...");
 
-        // glm-ocr ahora funciona correctamente con num_ctx=16384.
-        // Ya NO saltamos OCR — la estrategia dual (glm-ocr → moondream) es lo mejor.
-        // Solo reseteamos el circuit breaker por si se activó en una sesión anterior.
-        self.ollama.reset_vision_breaker();
-
         // 1. Resetear solo imágenes
         let reset_count = self.storage.reset_images_to_pending()?;
         tracing::info!("{} imágenes reseteadas para re-extracción", reset_count);
@@ -387,12 +382,7 @@ impl Soas {
 
         // 3. Re-escanear — solo imágenes se re-extraerán,
         //    texto/docs se saltarán (hash no cambió)
-        let scan_result = self.scan_all().await;
-
-        // Resetear circuit breaker por si falló durante este scan
-        self.ollama.reset_vision_breaker();
-
-        let results = scan_result?;
+        let results = self.scan_all().await?;
 
         // 4. Rebuild embeddings de archivos que perdieron vectores al hacer clear()
         //    (archivos de texto/docs cuyo hash no cambió → scan los saltó)

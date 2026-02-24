@@ -64,11 +64,11 @@ ordered-float = "4"
 # Bincode for vector serialization
 bincode = "1"
 
-# Regex for stripping thinking tokens
-regex = "1"
-
 # Interactive CLI (history + tab completion)
 rustyline = "14"
+
+# Cross-platform user directory paths (Downloads, Documents, Home, etc.)
+dirs = "5"
 
 [[bin]]
 name = "soas-cli"
