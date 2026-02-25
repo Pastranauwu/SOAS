@@ -479,7 +479,10 @@ fn is_garbage_vision_output(text: &str) -> bool {
     // Secuencias repetitivas (ej: "idmex18372729292929292929...")
     // Verificar si la segunda mitad del texto tiene muy poca variedad de caracteres
     if t.len() > 40 {
-        let second_half = &t[t.len() / 2..];
+        let mid = t.len() / 2;
+        // Ajustar al char boundary más cercano para evitar panic con UTF-8
+        let safe_mid = (mid..t.len()).find(|&i| t.is_char_boundary(i)).unwrap_or(t.len());
+        let second_half = &t[safe_mid..];
         let unique: std::collections::HashSet<char> = second_half.chars().collect();
         if unique.len() <= 4 {
             return true;

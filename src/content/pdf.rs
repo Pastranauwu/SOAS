@@ -1,13 +1,33 @@
 use crate::content::ExtractedContent;
 use crate::error::{Result, SoasError};
+use std::panic;
 use std::path::Path;
 use tracing::{debug, warn};
 
-/// Extrae texto de archivos PDF
+/// Extrae texto de archivos PDF.
+///
+/// Usa `catch_unwind` para atrapar panics internos de `pdf-extract`
+/// (por ejemplo, color spaces no soportados como DeviceN/PANTONE)
+/// y convertirlos en errores recuperables en lugar de abortar el proceso.
 pub fn extract(path: &Path) -> Result<ExtractedContent> {
     debug!("Extrayendo texto de PDF: {:?}", path);
 
-    let text = pdf_extract::extract_text(path).map_err(|e| {
+    let path_owned = path.to_path_buf();
+    let text = panic::catch_unwind(move || {
+        pdf_extract::extract_text(&path_owned)
+    })
+    .map_err(|panic_info| {
+        let msg = if let Some(s) = panic_info.downcast_ref::<String>() {
+            s.clone()
+        } else if let Some(s) = panic_info.downcast_ref::<&str>() {
+            s.to_string()
+        } else {
+            "panic desconocido en pdf-extract".to_string()
+        };
+        warn!("pdf-extract hizo panic en {:?}: {}", path, msg);
+        SoasError::ContentExtraction(format!("PDF panic (color space u otro): {}", msg))
+    })?
+    .map_err(|e| {
         warn!("Error extrayendo texto de PDF {:?}: {}", path, e);
         SoasError::ContentExtraction(format!("Error en PDF: {}", e))
     })?;

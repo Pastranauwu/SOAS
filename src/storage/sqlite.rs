@@ -956,6 +956,46 @@ impl SqliteStorage {
             index_status: IndexStatus::from_str_with_detail(&status_str, status_detail.as_deref()),
         })
     }
+
+    /// Obtiene un mapa path → (summary, description, keywords, content_type_group)
+    /// para todos los archivos indexados bajo un directorio dado.
+    /// Útil para enriquecer las entradas del explorador de archivos con metadata IA.
+    pub fn get_indexed_metadata_in_dir(
+        &self,
+        dir_path: &str,
+    ) -> Result<std::collections::HashMap<String, (Option<String>, Option<String>, Vec<String>, Option<String>)>> {
+        // Buscar archivos cuya ruta empiece con dir_path (con separador)
+        let prefix = if dir_path.ends_with('/') || dir_path.ends_with('\\') {
+            dir_path.to_string()
+        } else {
+            format!("{}%", dir_path)
+        };
+
+        let mut stmt = self.conn.prepare(
+            "SELECT path, metadata_json FROM indexed_files WHERE path LIKE ?1",
+        )?;
+
+        let mut map = std::collections::HashMap::new();
+        let rows = stmt.query_map(params![prefix], |row| {
+            let path: String = row.get(0)?;
+            let meta_json: String = row.get(1)?;
+            Ok((path, meta_json))
+        })?;
+
+        for row in rows {
+            if let Ok((path, meta_json)) = row {
+                let meta: FileMetadata = serde_json::from_str(&meta_json).unwrap_or_default();
+                map.insert(path, (
+                    meta.summary,
+                    meta.description,
+                    meta.keywords,
+                    meta.content_type_group,
+                ));
+            }
+        }
+
+        Ok(map)
+    }
 }
 
 #[cfg(test)]

@@ -495,6 +495,14 @@ struct DirEntry {
     modified: Option<String>,
     extension: Option<String>,
     is_indexed: bool,
+    /// Resumen generado por IA (solo si está indexado)
+    summary: Option<String>,
+    /// Descripción generada por IA (solo si está indexado)
+    description: Option<String>,
+    /// Palabras clave del archivo (solo si está indexado)
+    keywords: Vec<String>,
+    /// Grupo de tipo de contenido: "documento", "imagen", etc.
+    content_type_group: Option<String>,
 }
 
 /// Lista el contenido de un directorio real del SO
@@ -516,17 +524,21 @@ pub unsafe extern "C" fn soas_browse_directory(path: *const c_char) -> *mut c_ch
         }
 
         // Obtener hashes de archivos indexados para marcar cuáles están indexados
-        let indexed_paths: std::collections::HashSet<String> = {
+        let (indexed_paths, indexed_metadata) = {
             let state = SOAS.lock().unwrap();
             if let Some(ref s) = *state {
-                s.storage
+                let paths: std::collections::HashSet<String> = s.storage
                     .get_all_file_paths_and_hashes()
                     .unwrap_or_default()
                     .into_iter()
                     .map(|(_, p, _)| p)
-                    .collect()
+                    .collect();
+                let meta = s.storage
+                    .get_indexed_metadata_in_dir(path_str)
+                    .unwrap_or_default();
+                (paths, meta)
             } else {
-                std::collections::HashSet::new()
+                (std::collections::HashSet::new(), std::collections::HashMap::new())
             }
         };
 
@@ -556,6 +568,19 @@ pub unsafe extern "C" fn soas_browse_directory(path: *const c_char) -> *mut c_ch
             };
             let is_indexed = indexed_paths.contains(&path_string);
 
+            // Obtener metadata IA si el archivo está indexado
+            let (summary, description, keywords, content_type_group) =
+                if let Some(file_meta) = indexed_metadata.get(&path_string) {
+                    (
+                        file_meta.0.clone(),
+                        file_meta.1.clone(),
+                        file_meta.2.clone(),
+                        file_meta.3.clone(),
+                    )
+                } else {
+                    (None, None, Vec::new(), None)
+                };
+
             entries.push(DirEntry {
                 name: entry.file_name().to_string_lossy().to_string(),
                 path: path_string,
@@ -565,6 +590,10 @@ pub unsafe extern "C" fn soas_browse_directory(path: *const c_char) -> *mut c_ch
                 modified,
                 extension,
                 is_indexed,
+                summary,
+                description,
+                keywords,
+                content_type_group,
             });
         }
 
