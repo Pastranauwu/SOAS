@@ -87,6 +87,7 @@ impl SqliteStorage {
             CREATE INDEX IF NOT EXISTS idx_files_extension ON indexed_files(extension);
             CREATE INDEX IF NOT EXISTS idx_files_status ON indexed_files(index_status);
             CREATE INDEX IF NOT EXISTS idx_files_hash ON indexed_files(content_hash);
+            CREATE INDEX IF NOT EXISTS idx_files_filename ON indexed_files(filename COLLATE NOCASE);
 
             -- Categorías virtuales
             CREATE TABLE IF NOT EXISTS categories (
@@ -657,6 +658,232 @@ impl SqliteStorage {
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
         Ok(results)
+    }
+
+    // ─────────────────────────────────────────
+    //  Consultas del Gestor de Archivos
+    // ─────────────────────────────────────────
+
+    /// Búsqueda rápida tipo Spotlight en nombres de archivo e índice.
+    ///
+    /// Estrategia de ranking (igual que Spotlight):
+    ///   1 → nombre exacto (sin extensión)
+    ///   2 → nombre empieza por la consulta
+    ///   3 → alguna palabra del nombre empieza por la consulta
+    ///   4 → nombre contiene la consulta en cualquier posición
+    ///   5 → la ruta completa contiene la consulta (coincidencia de carpeta)
+    ///
+    /// Retorna hasta `limit` resultados ordenados por ranking + tamaño decreciente.
+    pub fn spotlight_search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<(IndexedFile, u8)>> {
+        if query.trim().is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Patrones para los distintos niveles de coincidencia
+        let q_lower      = query.to_lowercase();
+        let exact_pat    = q_lower.clone();          // nombre sin ext == query
+        let starts_pat   = format!("{}%", q_lower);  // filename LIKE 'q%'
+        let word_pat     = format!("% {}%", q_lower); // ' q' en algún lugar del nombre
+        let contains_pat = format!("%{}%", q_lower);  // nombre contiene q
+        let path_pat     = format!("%{}%", q_lower);  // ruta contiene q
+
+        let mut stmt = self.conn.prepare(
+            "SELECT
+                f.id, f.path, f.filename, f.extension, f.mime_type, f.size,
+                f.content_hash, f.content_preview, f.content_full,
+                f.metadata_json, f.created_at, f.modified_at, f.indexed_at,
+                f.index_status, f.index_status_detail,
+                CASE
+                    WHEN LOWER(REPLACE(f.filename, '.' || f.extension, '')) = ?1  THEN 1
+                    WHEN LOWER(f.filename) LIKE ?2                                 THEN 2
+                    WHEN LOWER(f.filename) LIKE ?3                                 THEN 3
+                    WHEN LOWER(f.filename) LIKE ?4                                 THEN 4
+                    WHEN LOWER(f.path)     LIKE ?5                                 THEN 5
+                    ELSE 99
+                END AS rank_score
+             FROM indexed_files f
+             WHERE LOWER(f.filename) LIKE ?4
+                OR LOWER(f.path)     LIKE ?5
+             ORDER BY rank_score ASC, f.size DESC
+             LIMIT ?6",
+        )?;
+
+        let results = stmt
+            .query_map(
+                rusqlite::params![
+                    exact_pat,
+                    starts_pat,
+                    word_pat,
+                    contains_pat,
+                    path_pat,
+                    limit as i64,
+                ],
+                |row| {
+                    let file  = self.row_to_indexed_file(row)?;
+                    let score = row.get::<_, u8>(15)?;
+                    Ok((file, score))
+                },
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(results)
+    }
+
+    /// Lista archivos indexados con paginación y filtros opcionales
+    pub fn get_files_paginated(
+        &self,
+        limit: usize,
+        offset: usize,
+        extension: Option<&str>,
+        path_prefix: Option<&str>,
+        sort_by: Option<&str>,
+    ) -> Result<Vec<IndexedFile>> {
+        let order = match sort_by.unwrap_or("modified_at") {
+            "name" => "filename ASC",
+            "size" => "size DESC",
+            "created_at" => "created_at DESC",
+            "indexed_at" => "indexed_at DESC",
+            _ => "modified_at DESC",
+        };
+
+        let sql = format!(
+            "SELECT id, path, filename, extension, mime_type, size,
+                    content_hash, content_preview, content_full,
+                    metadata_json, created_at, modified_at, indexed_at,
+                    index_status, index_status_detail
+             FROM indexed_files
+             WHERE (?1 IS NULL OR extension = ?1)
+               AND (?2 IS NULL OR path LIKE ?2)
+             ORDER BY {order}
+             LIMIT ?3 OFFSET ?4"
+        );
+
+        let prefix_pattern = path_prefix.map(|p| format!("{}%", p));
+        let mut stmt = self.conn.prepare(&sql)?;
+        let files = stmt
+            .query_map(
+                rusqlite::params![
+                    extension,
+                    prefix_pattern,
+                    limit as i64,
+                    offset as i64
+                ],
+                |row| self.row_to_indexed_file(row),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(files)
+    }
+
+    /// Archivos modificados más recientemente
+    pub fn get_recent_files(&self, limit: usize) -> Result<Vec<IndexedFile>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, path, filename, extension, mime_type, size,
+                    content_hash, content_preview, content_full,
+                    metadata_json, created_at, modified_at, indexed_at,
+                    index_status, index_status_detail
+             FROM indexed_files
+             ORDER BY modified_at DESC
+             LIMIT ?1",
+        )?;
+
+        let files = stmt
+            .query_map(params![limit as i64], |row| self.row_to_indexed_file(row))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(files)
+    }
+
+    /// Archivos con alguna de las extensiones dadas
+    pub fn get_files_by_extensions(
+        &self,
+        extensions: &[&str],
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<IndexedFile>> {
+        if extensions.is_empty() {
+            return Ok(vec![]);
+        }
+        let placeholders: Vec<String> = (1..=extensions.len()).map(|i| format!("?{}", i)).collect();
+        let sql = format!(
+            "SELECT id, path, filename, extension, mime_type, size,
+                    content_hash, content_preview, content_full,
+                    metadata_json, created_at, modified_at, indexed_at,
+                    index_status, index_status_detail
+             FROM indexed_files
+             WHERE extension IN ({})
+             ORDER BY modified_at DESC
+             LIMIT ?{} OFFSET ?{}",
+            placeholders.join(", "),
+            extensions.len() + 1,
+            extensions.len() + 2,
+        );
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = extensions
+            .iter()
+            .map(|e| Box::new(e.to_string()) as Box<dyn rusqlite::ToSql>)
+            .collect();
+        params_vec.push(Box::new(limit as i64));
+        params_vec.push(Box::new(offset as i64));
+
+        let params_ref: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        let files = stmt
+            .query_map(params_ref.as_slice(), |row| self.row_to_indexed_file(row))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(files)
+    }
+
+    /// Extensiones únicas presentes en la base de datos (para filtros)
+    pub fn get_distinct_extensions(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT extension FROM indexed_files
+             WHERE extension != ''
+             ORDER BY extension",
+        )?;
+        let exts = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(exts)
+    }
+
+    /// Total de archivos según filtros (para paginación)
+    pub fn count_files_filtered(
+        &self,
+        extension: Option<&str>,
+        path_prefix: Option<&str>,
+    ) -> Result<u64> {
+        let prefix_pattern = path_prefix.map(|p| format!("{}%", p));
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM indexed_files
+             WHERE (?1 IS NULL OR extension = ?1)
+               AND (?2 IS NULL OR path LIKE ?2)",
+            rusqlite::params![extension, prefix_pattern],
+            |row| row.get(0),
+        )?;
+        Ok(count as u64)
+    }
+
+    /// Actualiza los campos editables de una carpeta monitoreada
+    pub fn update_watched_folder(&self, folder: &WatchedFolder) -> Result<()> {
+        self.conn.execute(
+            "UPDATE watched_folders
+             SET name = ?1, recursive = ?2, exclude_patterns = ?3, active = ?4
+             WHERE id = ?5",
+            params![
+                folder.name,
+                folder.recursive as i32,
+                serde_json::to_string(&folder.exclude_patterns)?,
+                folder.active as i32,
+                folder.id,
+            ],
+        )?;
+        Ok(())
     }
 
     // ─────────────────────────────────────────

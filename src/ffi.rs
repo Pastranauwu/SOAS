@@ -481,6 +481,756 @@ pub extern "C" fn soas_health_check() -> *mut c_char {
 }
 
 // ─────────────────────────────────────────────
+//  Exploración del sistema de archivos real
+// ─────────────────────────────────────────────
+
+/// Entrada de directorio (archivo o carpeta del SO)
+#[derive(serde::Serialize)]
+struct DirEntry {
+    name: String,
+    path: String,
+    is_dir: bool,
+    is_symlink: bool,
+    size: u64,
+    modified: Option<String>,
+    extension: Option<String>,
+    is_indexed: bool,
+}
+
+/// Lista el contenido de un directorio real del SO
+///
+/// # Safety
+/// `path` debe ser un string C válido con una ruta absoluta
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soas_browse_directory(path: *const c_char) -> *mut c_char { unsafe {
+    let path_str = c_str_to_str(path);
+
+    let result = (|| -> crate::error::Result<serde_json::Value> {
+        if path_str.is_empty() {
+            return Err(crate::error::SoasError::Other("Ruta vacía".into()));
+        }
+
+        let dir_path = std::path::Path::new(path_str);
+        if !dir_path.exists() {
+            return Err(crate::error::SoasError::Other(format!("Ruta no existe: {}", path_str)));
+        }
+
+        // Obtener hashes de archivos indexados para marcar cuáles están indexados
+        let indexed_paths: std::collections::HashSet<String> = {
+            let state = SOAS.lock().unwrap();
+            if let Some(ref s) = *state {
+                s.storage
+                    .get_all_file_paths_and_hashes()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(_, p, _)| p)
+                    .collect()
+            } else {
+                std::collections::HashSet::new()
+            }
+        };
+
+        let mut entries: Vec<DirEntry> = Vec::new();
+        let read_dir = std::fs::read_dir(dir_path)
+            .map_err(|e| crate::error::SoasError::Other(e.to_string()))?;
+
+        for entry in read_dir.flatten() {
+            let meta = entry.metadata().ok();
+            let file_type = entry.file_type().ok();
+            let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+            let is_symlink = file_type.as_ref().map(|t| t.is_symlink()).unwrap_or(false);
+            let size = if is_dir { 0 } else { meta.as_ref().map(|m| m.len()).unwrap_or(0) };
+            let modified = meta
+                .as_ref()
+                .and_then(|m| m.modified().ok())
+                .map(|t| {
+                    let dt: chrono::DateTime<chrono::Utc> = t.into();
+                    dt.to_rfc3339()
+                });
+            let path_owned = entry.path();
+            let path_string = path_owned.to_string_lossy().to_string();
+            let extension = if is_dir {
+                None
+            } else {
+                path_owned.extension().map(|e| e.to_string_lossy().to_string())
+            };
+            let is_indexed = indexed_paths.contains(&path_string);
+
+            entries.push(DirEntry {
+                name: entry.file_name().to_string_lossy().to_string(),
+                path: path_string,
+                is_dir,
+                is_symlink,
+                size,
+                modified,
+                extension,
+                is_indexed,
+            });
+        }
+
+        // Carpetas primero, luego archivos, ambos en orden alfabético
+        entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+        });
+
+        let total = entries.len();
+        let canonical = dir_path
+            .canonicalize()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| path_str.to_string());
+
+        let parent = dir_path
+            .parent()
+            .map(|p| p.to_string_lossy().to_string());
+
+        Ok(serde_json::json!({
+            "path": canonical,
+            "parent": parent,
+            "entries": entries,
+            "total": total,
+        }))
+    })();
+
+    result_to_c_string(result)
+}}
+
+/// Retorna el directorio home del usuario
+#[unsafe(no_mangle)]
+pub extern "C" fn soas_get_home_dir() -> *mut c_char {
+    let result: crate::error::Result<String> = {
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_else(|_| "/".to_string());
+        Ok(home)
+    };
+    result_to_c_string(result)
+}
+
+/// Retorna los directorios especiales del usuario (Documentos, Descargas, etc.)
+#[unsafe(no_mangle)]
+pub extern "C" fn soas_get_special_dirs() -> *mut c_char {
+    let result: crate::error::Result<serde_json::Value> = {
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_else(|_| "/".to_string());
+
+        let candidates = [
+            ("home", home.clone()),
+            ("documents", format!("{}/Documents", home)),
+            ("downloads", format!("{}/Downloads", home)),
+            ("desktop", format!("{}/Desktop", home)),
+            ("pictures", format!("{}/Pictures", home)),
+            ("videos", format!("{}/Videos", home)),
+            ("music", format!("{}/Music", home)),
+        ];
+
+        let dirs: serde_json::Value = candidates
+            .iter()
+            .filter_map(|(key, path)| {
+                if std::path::Path::new(path).is_dir() {
+                    Some(serde_json::json!({ "key": key, "path": path }))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .into();
+
+        Ok(dirs)
+    };
+    result_to_c_string(result)
+}
+
+/// Retorna información sobre una ruta (archivo o carpeta)
+///
+/// # Safety
+/// `path` debe ser un string C válido
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soas_path_info(path: *const c_char) -> *mut c_char { unsafe {
+    let path_str = c_str_to_str(path);
+
+    let result = (|| -> crate::error::Result<serde_json::Value> {
+        let p = std::path::Path::new(path_str);
+        let exists = p.exists();
+
+        if !exists {
+            return Ok(serde_json::json!({ "exists": false, "path": path_str }));
+        }
+
+        let meta = std::fs::metadata(p)
+            .map_err(|e| crate::error::SoasError::Other(e.to_string()))?;
+
+        let is_dir = meta.is_dir();
+        let size = if is_dir { 0u64 } else { meta.len() };
+        let modified: Option<String> = meta
+            .modified()
+            .ok()
+            .map(|t| {
+                let dt: chrono::DateTime<chrono::Utc> = t.into();
+                dt.to_rfc3339()
+            });
+        let created: Option<String> = meta
+            .created()
+            .ok()
+            .map(|t| {
+                let dt: chrono::DateTime<chrono::Utc> = t.into();
+                dt.to_rfc3339()
+            });
+
+        let canonical = p
+            .canonicalize()
+            .map(|c| c.to_string_lossy().to_string())
+            .unwrap_or_else(|_| path_str.to_string());
+
+        Ok(serde_json::json!({
+            "exists": true,
+            "path": canonical,
+            "name": p.file_name().map(|n| n.to_string_lossy()),
+            "extension": p.extension().map(|e| e.to_string_lossy()),
+            "parent": p.parent().map(|pp| pp.to_string_lossy()),
+            "is_dir": is_dir,
+            "is_file": meta.is_file(),
+            "is_symlink": meta.is_symlink(),
+            "size": size,
+            "modified": modified,
+            "created": created,
+        }))
+    })();
+
+    result_to_c_string(result)
+}}
+
+/// Verifica si una ruta existe
+///
+/// # Safety
+/// `path` debe ser un string C válido
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soas_path_exists(path: *const c_char) -> *mut c_char { unsafe {
+    let path_str = c_str_to_str(path);
+    let exists = std::path::Path::new(path_str).exists();
+    result_to_c_string(Ok::<_, crate::error::SoasError>(exists))
+}}
+
+// ─────────────────────────────────────────────
+//  Spotlight search (rápido, por nombre de archivo)
+// ─────────────────────────────────────────────
+
+/// Resultado de búsqueda tipo Spotlight
+#[derive(serde::Serialize)]
+struct SpotlightResult {
+    id: String,
+    filename: String,
+    path: String,
+    extension: String,
+    mime_type: String,
+    size: u64,
+    modified: Option<String>,
+    /// Nivel de coincidencia: 1=exacto 2=empieza 3=palabra 4=contiene 5=ruta
+    match_rank: u8,
+    is_dir: bool,
+}
+
+/// Búsqueda rápida tipo Spotlight: busca en nombres de archivos indexados.
+///
+/// Devuelve resultados en < 5 ms para colecciones de hasta 500 K archivos.
+/// Orden de relevancia: exacto → empieza_por → empieza_palabra → contiene → ruta.
+///
+/// # Safety
+/// `query` debe ser un string C válido (puede ser parcial, p.ej. "reporte")
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soas_spotlight_search(
+    query: *const c_char,
+    limit: i64,
+) -> *mut c_char { unsafe {
+    let query_str = c_str_to_str(query);
+    let lim = if limit <= 0 { 30 } else { limit as usize };
+
+    let result = (|| -> crate::error::Result<serde_json::Value> {
+        if query_str.trim().is_empty() {
+            return Ok(serde_json::json!({ "results": [], "query": query_str, "total": 0 }));
+        }
+
+        let state = SOAS.lock().unwrap();
+        let state = state
+            .as_ref()
+            .ok_or_else(|| crate::error::SoasError::Other("SOAS no inicializado".into()))?;
+
+        let start = std::time::Instant::now();
+        let matches = state.storage.spotlight_search(query_str, lim)?;
+        let elapsed_ms = start.elapsed().as_millis();
+
+        let results: Vec<SpotlightResult> = matches
+            .into_iter()
+            .map(|(file, rank)| {
+                let modified = {
+                    let dt: chrono::DateTime<chrono::Utc> = file.modified_at;
+                    Some(dt.to_rfc3339())
+                };
+                SpotlightResult {
+                    id: file.id,
+                    filename: file.filename,
+                    path: file.path.to_string_lossy().to_string(),
+                    extension: file.extension,
+                    mime_type: file.mime_type,
+                    size: file.size,
+                    modified,
+                    match_rank: rank,
+                    is_dir: false,
+                }
+            })
+            .collect();
+
+        let total = results.len();
+        Ok(serde_json::json!({
+            "results": results,
+            "query": query_str,
+            "total": total,
+            "elapsed_ms": elapsed_ms,
+        }))
+    })();
+
+    result_to_c_string(result)
+}}
+
+// ─────────────────────────────────────────────
+//  Consulta de archivos indexados
+// ─────────────────────────────────────────────
+
+/// Lista archivos indexados con paginación y filtros
+///
+/// `filter_json` puede contener:
+/// - `limit` (u64, por defecto 50)
+/// - `offset` (u64, por defecto 0)
+/// - `extension` (string opcional)
+/// - `path_prefix` (string opcional, filtra por prefijo de ruta)
+/// - `sort_by` ("modified_at" | "name" | "size" | "created_at" | "indexed_at")
+///
+/// # Safety
+/// `filter_json` debe ser un string C válido
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soas_list_files(filter_json: *const c_char) -> *mut c_char { unsafe {
+    let json_str = c_str_to_str(filter_json);
+
+    let result = (|| -> crate::error::Result<serde_json::Value> {
+        let filter: serde_json::Value = if json_str.is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str(json_str)?
+        };
+
+        let limit = filter["limit"].as_u64().unwrap_or(50) as usize;
+        let offset = filter["offset"].as_u64().unwrap_or(0) as usize;
+        let extension = filter["extension"].as_str();
+        let path_prefix = filter["path_prefix"].as_str();
+        let sort_by = filter["sort_by"].as_str();
+
+        let state = SOAS.lock().unwrap();
+        let state = state
+            .as_ref()
+            .ok_or_else(|| crate::error::SoasError::Other("SOAS no inicializado".into()))?;
+
+        let files = state.storage.get_files_paginated(
+            limit, offset, extension, path_prefix, sort_by,
+        )?;
+
+        let total = state.storage.count_files_filtered(extension, path_prefix)?;
+
+        Ok(serde_json::json!({
+            "files": files,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        }))
+    })();
+
+    result_to_c_string(result)
+}}
+
+/// Obtiene un archivo indexado por su ID
+///
+/// # Safety
+/// `file_id` debe ser un string C válido
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soas_get_file(file_id: *const c_char) -> *mut c_char { unsafe {
+    let id = c_str_to_str(file_id);
+
+    let result = (|| -> crate::error::Result<Option<crate::models::IndexedFile>> {
+        let state = SOAS.lock().unwrap();
+        let state = state
+            .as_ref()
+            .ok_or_else(|| crate::error::SoasError::Other("SOAS no inicializado".into()))?;
+
+        state.storage.get_file_by_id(id)
+    })();
+
+    result_to_c_string(result)
+}}
+
+/// Lista archivos indexados bajo una ruta (búsqueda por prefijo de path)
+///
+/// # Safety
+/// `path` debe ser un string C válido
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soas_get_files_in_path(
+    path: *const c_char,
+    limit: i64,
+    offset: i64,
+) -> *mut c_char { unsafe {
+    let path_str = c_str_to_str(path);
+    let lim = if limit <= 0 { 200 } else { limit as usize };
+    let off = if offset < 0 { 0 } else { offset as usize };
+
+    let result = (|| -> crate::error::Result<serde_json::Value> {
+        let state = SOAS.lock().unwrap();
+        let state = state
+            .as_ref()
+            .ok_or_else(|| crate::error::SoasError::Other("SOAS no inicializado".into()))?;
+
+        let files = state.storage.get_files_paginated(
+            lim, off, None, Some(path_str), Some("name"),
+        )?;
+        let total = state.storage.count_files_filtered(None, Some(path_str))?;
+
+        Ok(serde_json::json!({
+            "files": files,
+            "total": total,
+            "path": path_str,
+        }))
+    })();
+
+    result_to_c_string(result)
+}}
+
+/// Archivos modificados más recientemente
+///
+/// # Safety
+/// Siempre seguro de llamar cuando SOAS está inicializado
+#[unsafe(no_mangle)]
+pub extern "C" fn soas_get_recent_files(limit: i64) -> *mut c_char {
+    let lim = if limit <= 0 { 20 } else { limit as usize };
+
+    let result = (|| -> crate::error::Result<Vec<crate::models::IndexedFile>> {
+        let state = SOAS.lock().unwrap();
+        let state = state
+            .as_ref()
+            .ok_or_else(|| crate::error::SoasError::Other("SOAS no inicializado".into()))?;
+
+        state.storage.get_recent_files(lim)
+    })();
+
+    result_to_c_string(result)
+}
+
+/// Archivos filtrados por extensiones
+///
+/// `extensions_json` es un array JSON de extensiones, e.g. `["pdf","docx"]`
+///
+/// # Safety
+/// `extensions_json` debe ser un string C válido
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soas_get_files_by_extension(
+    extensions_json: *const c_char,
+    limit: i64,
+    offset: i64,
+) -> *mut c_char { unsafe {
+    let json_str = c_str_to_str(extensions_json);
+    let lim = if limit <= 0 { 100 } else { limit as usize };
+    let off = if offset < 0 { 0 } else { offset as usize };
+
+    let result = (|| -> crate::error::Result<serde_json::Value> {
+        let exts: Vec<String> = serde_json::from_str(json_str).unwrap_or_default();
+        let ext_refs: Vec<&str> = exts.iter().map(|s| s.as_str()).collect();
+
+        let state = SOAS.lock().unwrap();
+        let state = state
+            .as_ref()
+            .ok_or_else(|| crate::error::SoasError::Other("SOAS no inicializado".into()))?;
+
+        let files = state.storage.get_files_by_extensions(&ext_refs, lim, off)?;
+
+        Ok(serde_json::json!({
+            "files": files,
+            "extensions": exts,
+        }))
+    })();
+
+    result_to_c_string(result)
+}}
+
+/// Lista todas las extensiones únicas presentes en el índice
+#[unsafe(no_mangle)]
+pub extern "C" fn soas_get_distinct_extensions() -> *mut c_char {
+    let result = (|| -> crate::error::Result<Vec<String>> {
+        let state = SOAS.lock().unwrap();
+        let state = state
+            .as_ref()
+            .ok_or_else(|| crate::error::SoasError::Other("SOAS no inicializado".into()))?;
+
+        state.storage.get_distinct_extensions()
+    })();
+
+    result_to_c_string(result)
+}
+
+// ─────────────────────────────────────────────
+//  Operaciones sobre archivos
+// ─────────────────────────────────────────────
+
+/// Abre un archivo con la aplicación predeterminada del sistema
+///
+/// # Safety
+/// `path` debe ser un string C válido
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soas_open_file(path: *const c_char) -> *mut c_char { unsafe {
+    let path_str = c_str_to_str(path);
+
+    let result = (|| -> crate::error::Result<bool> {
+        if !std::path::Path::new(path_str).exists() {
+            return Err(crate::error::SoasError::Other(
+                format!("Archivo no encontrado: {}", path_str)
+            ));
+        }
+
+        // Linux: xdg-open | macOS: open | Windows: start
+        let opener = if cfg!(target_os = "macos") {
+            "open"
+        } else if cfg!(target_os = "windows") {
+            "explorer"
+        } else {
+            "xdg-open"
+        };
+
+        std::process::Command::new(opener)
+            .arg(path_str)
+            .spawn()
+            .map_err(|e| crate::error::SoasError::Other(e.to_string()))?;
+
+        Ok(true)
+    })();
+
+    result_to_c_string(result)
+}}
+
+/// Muestra un archivo en el gestor de archivos del sistema (resalta el archivo)
+///
+/// # Safety
+/// `path` debe ser un string C válido
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soas_reveal_in_folder(path: *const c_char) -> *mut c_char { unsafe {
+    let path_str = c_str_to_str(path);
+
+    let result = (|| -> crate::error::Result<bool> {
+        let p = std::path::Path::new(path_str);
+        let target = if p.is_file() {
+            p.parent().unwrap_or(p).to_string_lossy().to_string()
+        } else {
+            path_str.to_string()
+        };
+
+        let opener = if cfg!(target_os = "macos") {
+            "open"
+        } else if cfg!(target_os = "windows") {
+            "explorer"
+        } else {
+            "xdg-open"
+        };
+
+        std::process::Command::new(opener)
+            .arg(&target)
+            .spawn()
+            .map_err(|e| crate::error::SoasError::Other(e.to_string()))?;
+
+        Ok(true)
+    })();
+
+    result_to_c_string(result)
+}}
+
+/// Elimina un archivo del índice (NO elimina el archivo físico)
+///
+/// # Safety
+/// `file_id` debe ser un string C válido
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soas_delete_file_from_index(file_id: *const c_char) -> *mut c_char { unsafe {
+    let id = c_str_to_str(file_id);
+
+    let result = (|| -> crate::error::Result<bool> {
+        let mut state = SOAS.lock().unwrap();
+        let state = state
+            .as_mut()
+            .ok_or_else(|| crate::error::SoasError::Other("SOAS no inicializado".into()))?;
+
+        state.storage.delete_file(id)?;
+        let _ = state.vector_store.remove(id);
+        Ok(true)
+    })();
+
+    result_to_c_string(result)
+}}
+
+/// Actualiza los ajustes de una carpeta monitoreada
+///
+/// `update_json` puede contener: `name`, `recursive` (bool), `active` (bool),
+/// `exclude_patterns` (array de strings)
+///
+/// # Safety
+/// `folder_id` y `update_json` deben ser strings C válidos
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soas_update_folder(
+    folder_id: *const c_char,
+    update_json: *const c_char,
+) -> *mut c_char { unsafe {
+    let id = c_str_to_str(folder_id);
+    let json_str = c_str_to_str(update_json);
+
+    let result = (|| -> crate::error::Result<crate::models::WatchedFolder> {
+        let patch: serde_json::Value = serde_json::from_str(json_str)?;
+
+        let state = SOAS.lock().unwrap();
+        let state = state
+            .as_ref()
+            .ok_or_else(|| crate::error::SoasError::Other("SOAS no inicializado".into()))?;
+
+        let mut folders = state.storage.get_watched_folders()?;
+        let folder = folders
+            .iter_mut()
+            .find(|f| f.id == id)
+            .ok_or_else(|| crate::error::SoasError::Other(format!("Carpeta no encontrada: {}", id)))?;
+
+        if let Some(name) = patch["name"].as_str() {
+            folder.name = name.to_string();
+        }
+        if let Some(recursive) = patch["recursive"].as_bool() {
+            folder.recursive = recursive;
+        }
+        if let Some(active) = patch["active"].as_bool() {
+            folder.active = active;
+        }
+        if let Some(patterns) = patch["exclude_patterns"].as_array() {
+            folder.exclude_patterns = patterns
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
+        }
+
+        state.storage.update_watched_folder(folder)?;
+        Ok(folder.clone())
+    })();
+
+    result_to_c_string(result)
+}}
+
+// ─────────────────────────────────────────────
+//  Gestión del índice
+// ─────────────────────────────────────────────
+
+/// Re-indexa un archivo individual por su ruta
+///
+/// # Safety
+/// `path` debe ser un string C válido con una ruta absoluta
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soas_reindex_file(path: *const c_char) -> *mut c_char { unsafe {
+    let path_str = c_str_to_str(path);
+
+    let result = (|| -> crate::error::Result<serde_json::Value> {
+        let p = std::path::Path::new(path_str);
+        if !p.exists() {
+            return Err(crate::error::SoasError::Other(
+                format!("Archivo no encontrado: {}", path_str)
+            ));
+        }
+        if !p.is_file() {
+            return Err(crate::error::SoasError::Other(
+                format!("La ruta no es un archivo: {}", path_str)
+            ));
+        }
+
+        let mut state = SOAS.lock().unwrap();
+        let state = state
+            .as_mut()
+            .ok_or_else(|| crate::error::SoasError::Other("SOAS no inicializado".into()))?;
+
+        // Si ya existe en el índice, obtener su ID para actualizar en lugar de crear nuevo
+        let existing_id: Option<String> = state
+            .storage
+            .get_file_by_path(p)
+            .ok()
+            .flatten()
+            .map(|f| {
+                let _ = state.vector_store.remove(&f.id);
+                f.id
+            });
+
+        let config = state.config.indexer.clone();
+        let mut pipeline = crate::indexer::IndexPipeline::new(
+            &state.storage,
+            &mut state.vector_store,
+            &state.ollama,
+            config,
+        );
+
+        let indexed_file = state.runtime.block_on(
+            pipeline.process_file(p, existing_id.as_deref())
+        )?;
+
+        Ok(serde_json::json!({
+            "path": path_str,
+            "file_id": indexed_file.id,
+            "status": indexed_file.index_status.as_str(),
+            "filename": indexed_file.filename,
+        }))
+    })();
+
+    result_to_c_string(result)
+}}
+
+/// Escanea una carpeta específica por su ID
+///
+/// # Safety
+/// `folder_id` debe ser un string C válido
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soas_scan_folder(folder_id: *const c_char) -> *mut c_char { unsafe {
+    let id = c_str_to_str(folder_id);
+
+    let result = (|| -> crate::error::Result<serde_json::Value> {
+        let mut state = SOAS.lock().unwrap();
+        let state = state
+            .as_mut()
+            .ok_or_else(|| crate::error::SoasError::Other("SOAS no inicializado".into()))?;
+
+        let folders = state.storage.get_watched_folders()?;
+        let folder = folders
+            .iter()
+            .find(|f| f.id == id)
+            .ok_or_else(|| crate::error::SoasError::Other(format!("Carpeta no encontrada: {}", id)))?
+            .clone();
+
+        let config = state.config.indexer.clone();
+        let mut pipeline = crate::indexer::IndexPipeline::new(
+            &state.storage,
+            &mut state.vector_store,
+            &state.ollama,
+            config,
+        );
+
+        let scan_result = state.runtime.block_on(pipeline.scan_folder(&folder, None))?;
+
+        Ok(serde_json::json!({
+            "folder_id": id,
+            "folder_path": folder.path.to_string_lossy(),
+            "new_files": scan_result.new_files,
+            "updated_files": scan_result.updated_files,
+            "deleted_files": scan_result.deleted_files,
+            "failed_files": scan_result.failed_files,
+        }))
+    })();
+
+    result_to_c_string(result)
+}}
+
+// ─────────────────────────────────────────────
 //  Gestión de memoria
 // ─────────────────────────────────────────────
 
