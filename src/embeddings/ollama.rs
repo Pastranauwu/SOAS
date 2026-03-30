@@ -137,23 +137,23 @@ impl OllamaClient {
         })
     }
 
-    /// Opciones de runtime para qwen3:1.7b (chat general).
+    /// Opciones de runtime para qwen3:4b (chat general).
     fn chat_runtime_options() -> serde_json::Value {
         serde_json::json!({
-            "num_ctx": 3072,
-            "num_predict": 512,
+            "num_ctx": 4096,
+            "num_predict": 768,
             "temperature": 0.2
         })
     }
 
     /// Opciones para chat que espera respuesta JSON.
-    /// num_predict=512: el JSON de describe_file necesita ~200-400 tokens.
+    /// num_predict=768: qwen3:4b genera JSON más rico y detallado.
     /// Con think=false (en el request), no se desperdician tokens en razonamiento.
     fn chat_json_runtime_options() -> serde_json::Value {
         serde_json::json!({
-            "num_ctx": 2048,
-            "num_predict": 512,
-            "temperature": 0.2
+            "num_ctx": 4096,
+            "num_predict": 768,
+            "temperature": 0.15
         })
     }
 
@@ -161,8 +161,8 @@ impl OllamaClient {
     /// temperature=0: determinista para la misma consulta.
     fn chat_search_runtime_options() -> serde_json::Value {
         serde_json::json!({
-            "num_ctx": 2048,
-            "num_predict": 512,
+            "num_ctx": 3072,
+            "num_predict": 768,
             "temperature": 0.0
         })
     }
@@ -463,22 +463,26 @@ impl OllamaClient {
         content_preview: &str,
         folder_path: &str,
     ) -> Result<FileDescription> {
-        let system_prompt = r#"Eres un indexador de archivos. Genera SOLO un JSON válido en español.
-Reglas:
-- "title": título corto y descriptivo del contenido real (no el nombre del archivo)
-- "summary": 1-3 oraciones que resuman el contenido para que alguien decida si es el archivo que busca SIN tenerlo que abrir. Sé específico: menciona nombres, fechas, temas principales.
-- "keywords": 4-6 palabras/frases clave CONCRETAS para búsqueda. Nombres propios, términos técnicos, entidades. NO incluyas "archivo", "documento", "texto".
-- "semantic_tags": 2-3 etiquetas temáticas amplias (ej: "finanzas", "salud", "programación")
-- "language": código ISO ("es", "en")
-- "content_type_group": uno de: "documento", "imagen", "hoja_calculo", "codigo", "presentacion"
+        let system_prompt = r#"Eres un experto analista de documentos especializado en indexación semántica. Tu tarea es extraer metadatos de alta calidad de archivos para un motor de búsqueda.
 
-Solo JSON."#;
+RESPONDE ÚNICAMENTE con un JSON válido. Sin texto antes ni después. Sin bloques ```json.
+
+CAMPOS REQUERIDOS:
+- "title": Título descriptivo y profesional (máx. 80 chars). Si el nombre de archivo es críptico, infiere un título real del contenido.
+- "summary": Resumen ejecutivo de 3-5 oraciones DENSAS en información. OBLIGATORIO incluir cuando estén presentes: fechas exactas, nombres completos de personas/empresas/instituciones, montos con moneda, números de referencia/folio, propósito del documento y conclusiones.
+- "keywords": Array de 10-15 términos de búsqueda de ALTA ESPECIFICIDAD. Incluye: nombres propios, términos técnicos del dominio, acrónimos, sinónimos, variantes ortográficas. EVITA palabras genéricas como "documento", "archivo", "información".
+- "semantic_tags": Array de 3-6 etiquetas taxonómicas en formato "Categoría/Subcategoría" (ej: "Legal/Contrato", "Finanzas/Factura", "RRHH/Nómina", "Técnico/Manual", "Educativo/Tarea").
+- "language": Código ISO 639-1 del idioma principal del contenido.
+- "content_type_group": UNO de: "documento", "hoja_calculo", "presentacion", "codigo", "imagen", "audio", "otro".
+
+EJEMPLO DE SALIDA CORRECTA:
+{"title":"Contrato de Arrendamiento - Edificio Colón","summary":"Contrato de arrendamiento firmado el 15/03/2024 entre Inmobiliaria Torres S.A. (arrendador) y Juan Pérez García (arrendatario) para el departamento 4B del Edificio Colón, con renta mensual de $12,500 MXN. Vigencia de 12 meses a partir del 01/04/2024. Incluye cláusulas de depósito ($25,000), mantenimiento y causales de rescisión.","keywords":["arrendamiento","contrato renta","Inmobiliaria Torres","Juan Pérez García","departamento 4B","Edificio Colón","$12500","depósito","renta mensual","rescisión","arrendador","arrendatario","2024"],"semantic_tags":["Legal/Contrato","Finanzas/Arrendamiento","Inmobiliario/Departamento"],"language":"es","content_type_group":"documento"}"#;
 
         let user_message = format!(
-            "Archivo: {}\nCarpeta: {}\n\nContenido:\n{}",
+            "Archivo: {}\nCarpeta: {}\n\nContenido del documento:\n{}",
             filename,
             folder_path,
-            safe_truncate(content_preview, 500)
+            safe_truncate(content_preview, 1200)
         );
 
         let response = self.chat_json(system_prompt, &user_message).await?;

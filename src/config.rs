@@ -97,16 +97,16 @@ impl Default for OllamaConfig {
         Self {
             base_url: "http://localhost:11434".to_string(),
             embedding_model: "nomic-embed-text".to_string(),
-            // qwen3:1.7b: rápido en CPU, buen rendimiento en JSON y clasificación.
-            chat_model: "qwen3:1.7b".to_string(),
+            // qwen3:4b: mucho mejor comprensión, resúmenes y extracción de keywords
+            // que 1.7b, con un overhead aceptable en CPU (4-5 GB RAM).
+            chat_model: "qwen3:4b".to_string(),
             // llava-phi3: modelo de visión ligero (3.8B), rápido y preciso en CPU.
             vision_model: "llava-phi3:latest".to_string(),
             description_model: "llava-phi3:latest".to_string(),
-            // 300s: inferencia en CPU para documentos largos
-            timeout_secs: 300,
-            // 120s: el primer request paga la carga del modelo (~10-15s).
-            // Requests posteriores son más rápidos porque el modelo ya está en RAM.
-            vision_timeout_secs: 120,
+            // 450s: qwen3:4b puede tardar más en CPU para documentos largos
+            timeout_secs: 450,
+            // 150s: margen extra para la carga inicial del modelo.
+            vision_timeout_secs: 150,
             embedding_dimensions: 768, // nomic-embed-text default
         }
     }

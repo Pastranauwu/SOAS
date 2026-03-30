@@ -16,6 +16,7 @@ use crate::storage::SqliteStorage;
 use crate::vector_store::{InMemoryVectorStore, VectorStore};
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
+use std::panic;
 use std::sync::Mutex;
 use tracing::error;
 
@@ -63,6 +64,36 @@ fn result_to_c_string<T: serde::Serialize>(result: Result<T>) -> *mut c_char {
         .into_raw()
 }
 
+/// Retorna un JSON de error como C string (para use en catch_unwind)
+fn error_c_string(msg: &str) -> *mut c_char {
+    let json = format!(r#"{{"success": false, "error": "{}"}}"#, msg.replace('"', "'"));
+    CString::new(json)
+        .unwrap_or_else(|_| CString::new(r#"{"success": false, "error": "error interno"}"#).unwrap())
+        .into_raw()
+}
+
+/// Wrapper seguro para funciones FFI: atrapa panics y los convierte en errores JSON.
+/// Evita undefined behavior cuando un panic cruza la frontera FFI.
+fn safe_ffi<F>(f: F) -> *mut c_char
+where
+    F: FnOnce() -> *mut c_char + panic::UnwindSafe,
+{
+    match panic::catch_unwind(f) {
+        Ok(ptr) => ptr,
+        Err(e) => {
+            let msg = if let Some(s) = e.downcast_ref::<&str>() {
+                format!("Panic en FFI: {}", s)
+            } else if let Some(s) = e.downcast_ref::<String>() {
+                format!("Panic en FFI: {}", s)
+            } else {
+                "Panic desconocido en FFI".to_string()
+            };
+            error!("{}", msg);
+            error_c_string(&msg)
+        }
+    }
+}
+
 /// Convierte un C string a &str
 unsafe fn c_str_to_str<'a>(ptr: *const c_char) -> &'a str { unsafe {
     if ptr.is_null() {
@@ -70,6 +101,11 @@ unsafe fn c_str_to_str<'a>(ptr: *const c_char) -> &'a str { unsafe {
     }
     CStr::from_ptr(ptr).to_str().unwrap_or("")
 }}
+
+/// Adquiere el lock del estado global de forma segura (sin panic en mutex envenenado).
+fn lock_soas() -> Result<std::sync::MutexGuard<'static, Option<SoasState>>> {
+    SOAS.lock().map_err(|e| crate::error::SoasError::Other(format!("Mutex envenenado: {}", e)))
+}
 
 // ─────────────────────────────────────────────
 //  Inicialización
@@ -80,66 +116,70 @@ unsafe fn c_str_to_str<'a>(ptr: *const c_char) -> &'a str { unsafe {
 /// # Safety
 /// `config_path` puede ser null (usa config por defecto) o un path válido a un JSON de config
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soas_init(config_path: *const c_char) -> *mut c_char { unsafe {
-    let result = (|| -> Result<String> {
-        // Inicializar logging
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::from_default_env()
-                    .add_directive(tracing::Level::INFO.into()),
-            )
-            .try_init();
+pub unsafe extern "C" fn soas_init(config_path: *const c_char) -> *mut c_char {
+    let cp = config_path;
+    safe_ffi(move || { unsafe {
+        let result = (|| -> Result<String> {
+            // Inicializar logging
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::from_default_env()
+                        .add_directive(tracing::Level::INFO.into()),
+                )
+                .try_init();
 
-        let config = if config_path.is_null() {
-            SoasConfig::default()
-        } else {
-            let path = c_str_to_str(config_path);
-            SoasConfig::load(std::path::Path::new(path))?
-        };
+            let config = if cp.is_null() {
+                SoasConfig::default()
+            } else {
+                let path = c_str_to_str(cp);
+                SoasConfig::load(std::path::Path::new(path))?
+            };
 
-        // Crear directorio de datos
-        std::fs::create_dir_all(&config.storage.data_dir)?;
+            // Crear directorio de datos
+            std::fs::create_dir_all(&config.storage.data_dir)?;
 
-        // Abrir SQLite
-        let storage = SqliteStorage::open(&config.storage.db_path())?;
+            // Abrir SQLite
+            let storage = SqliteStorage::open(&config.storage.db_path())?;
 
-        // Abrir vector store
-        let vector_store = InMemoryVectorStore::open(
-            config.storage.vector_store_path(),
-            config.ollama.embedding_dimensions,
-        )?;
+            // Abrir vector store
+            let vector_store = InMemoryVectorStore::open(
+                config.storage.vector_store_path(),
+                config.ollama.embedding_dimensions,
+            )?;
 
-        // Crear cliente Ollama
-        let ollama = OllamaClient::new(config.ollama.clone());
+            // Crear cliente Ollama
+            let ollama = OllamaClient::new(config.ollama.clone());
 
-        // Crear runtime de Tokio
-        let runtime = tokio::runtime::Runtime::new()
-            .map_err(|e| crate::error::SoasError::Other(e.to_string()))?;
+            // Crear runtime de Tokio
+            let runtime = tokio::runtime::Runtime::new()
+                .map_err(|e| crate::error::SoasError::Other(e.to_string()))?;
 
-        let mut state = SOAS.lock().unwrap();
-        *state = Some(SoasState {
-            config,
-            storage,
-            vector_store,
-            ollama,
-            runtime,
-        });
+            let mut state = lock_soas()?;
+            *state = Some(SoasState {
+                config,
+                storage,
+                vector_store,
+                ollama,
+                runtime,
+            });
 
-        Ok("SOAS inicializado correctamente".to_string())
-    })();
+            Ok("SOAS inicializado correctamente".to_string())
+        })();
 
-    result_to_c_string(result)
-}}
+        result_to_c_string(result)
+    }})
+}
 
 /// Libera los recursos de SOAS
 #[unsafe(no_mangle)]
 pub extern "C" fn soas_destroy() {
-    let mut state = SOAS.lock().unwrap();
-    if let Some(ref s) = *state {
-        // Guardar vectores pendientes
-        let _ = s.vector_store.save();
+    if let Ok(mut state) = SOAS.lock() {
+        if let Some(ref s) = *state {
+            // Guardar vectores pendientes
+            let _ = s.vector_store.save();
+        }
+        *state = None;
     }
-    *state = None;
 }
 
 // ─────────────────────────────────────────────
@@ -159,7 +199,7 @@ pub unsafe extern "C" fn soas_add_folder(
     let name_str = c_str_to_str(name);
 
     let result = (|| -> Result<WatchedFolder> {
-        let state = SOAS.lock().unwrap();
+        let state = lock_soas()?;
         let state = state
             .as_ref()
             .ok_or_else(|| crate::error::SoasError::Other("SOAS no inicializado".into()))?;
@@ -178,7 +218,7 @@ pub unsafe extern "C" fn soas_add_folder(
 #[unsafe(no_mangle)]
 pub extern "C" fn soas_list_folders() -> *mut c_char {
     let result = (|| -> Result<Vec<WatchedFolder>> {
-        let state = SOAS.lock().unwrap();
+        let state = lock_soas()?;
         let state = state
             .as_ref()
             .ok_or_else(|| crate::error::SoasError::Other("SOAS no inicializado".into()))?;
@@ -198,7 +238,7 @@ pub unsafe extern "C" fn soas_remove_folder(folder_id: *const c_char) -> *mut c_
     let id = c_str_to_str(folder_id);
 
     let result = (|| -> Result<bool> {
-        let state = SOAS.lock().unwrap();
+        let state = lock_soas()?;
         let state = state
             .as_ref()
             .ok_or_else(|| crate::error::SoasError::Other("SOAS no inicializado".into()))?;
@@ -218,7 +258,7 @@ pub unsafe extern "C" fn soas_remove_folder(folder_id: *const c_char) -> *mut c_
 #[unsafe(no_mangle)]
 pub extern "C" fn soas_scan_all() -> *mut c_char {
     let result = (|| -> Result<serde_json::Value> {
-        let mut state = SOAS.lock().unwrap();
+        let mut state = lock_soas()?;
         let state = state
             .as_mut()
             .ok_or_else(|| crate::error::SoasError::Other("SOAS no inicializado".into()))?;
@@ -283,7 +323,7 @@ pub unsafe extern "C" fn soas_search(query_json: *const c_char) -> *mut c_char {
     let result = (|| -> Result<Vec<SearchResult>> {
         let query: SearchQuery = serde_json::from_str(json_str)?;
 
-        let state = SOAS.lock().unwrap();
+        let state = lock_soas()?;
         let state = state
             .as_ref()
             .ok_or_else(|| crate::error::SoasError::Other("SOAS no inicializado".into()))?;
@@ -312,7 +352,7 @@ pub unsafe extern "C" fn soas_quick_search(query_text: *const c_char) -> *mut c_
     let result = (|| -> Result<Vec<SearchResult>> {
         let query = SearchQuery::new(text);
 
-        let state = SOAS.lock().unwrap();
+        let state = lock_soas()?;
         let state = state
             .as_ref()
             .ok_or_else(|| crate::error::SoasError::Other("SOAS no inicializado".into()))?;
@@ -338,7 +378,7 @@ pub unsafe extern "C" fn soas_quick_search(query_text: *const c_char) -> *mut c_
 #[unsafe(no_mangle)]
 pub extern "C" fn soas_get_categories() -> *mut c_char {
     let result = (|| -> Result<Vec<crate::virtual_fs::manager::CategoryTree>> {
-        let state = SOAS.lock().unwrap();
+        let state = lock_soas()?;
         let state = state
             .as_ref()
             .ok_or_else(|| crate::error::SoasError::Other("SOAS no inicializado".into()))?;
@@ -369,7 +409,7 @@ pub unsafe extern "C" fn soas_create_category(
     };
 
     let result = (|| -> Result<Category> {
-        let state = SOAS.lock().unwrap();
+        let state = lock_soas()?;
         let state = state
             .as_ref()
             .ok_or_else(|| crate::error::SoasError::Other("SOAS no inicializado".into()))?;
@@ -396,7 +436,7 @@ pub unsafe extern "C" fn soas_assign_file(
     let vname = c_str_to_str(virtual_name);
 
     let result = (|| -> Result<VirtualFile> {
-        let state = SOAS.lock().unwrap();
+        let state = lock_soas()?;
         let state = state
             .as_ref()
             .ok_or_else(|| crate::error::SoasError::Other("SOAS no inicializado".into()))?;
@@ -417,7 +457,7 @@ pub unsafe extern "C" fn soas_get_category_files(category_id: *const c_char) -> 
     let cat_id = c_str_to_str(category_id);
 
     let result = (|| -> Result<Vec<serde_json::Value>> {
-        let state = SOAS.lock().unwrap();
+        let state = lock_soas()?;
         let state = state
             .as_ref()
             .ok_or_else(|| crate::error::SoasError::Other("SOAS no inicializado".into()))?;
@@ -447,7 +487,7 @@ pub unsafe extern "C" fn soas_get_category_files(category_id: *const c_char) -> 
 #[unsafe(no_mangle)]
 pub extern "C" fn soas_get_stats() -> *mut c_char {
     let result = (|| -> Result<SystemStats> {
-        let state = SOAS.lock().unwrap();
+        let state = lock_soas()?;
         let state = state
             .as_ref()
             .ok_or_else(|| crate::error::SoasError::Other("SOAS no inicializado".into()))?;
@@ -462,7 +502,7 @@ pub extern "C" fn soas_get_stats() -> *mut c_char {
 #[unsafe(no_mangle)]
 pub extern "C" fn soas_health_check() -> *mut c_char {
     let result = (|| -> Result<serde_json::Value> {
-        let state = SOAS.lock().unwrap();
+        let state = lock_soas()?;
         let state = state
             .as_ref()
             .ok_or_else(|| crate::error::SoasError::Other("SOAS no inicializado".into()))?;
@@ -510,8 +550,10 @@ struct DirEntry {
 /// # Safety
 /// `path` debe ser un string C válido con una ruta absoluta
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn soas_browse_directory(path: *const c_char) -> *mut c_char { unsafe {
-    let path_str = c_str_to_str(path);
+pub unsafe extern "C" fn soas_browse_directory(path: *const c_char) -> *mut c_char {
+    let p = path;
+    safe_ffi(move || { unsafe {
+    let path_str = c_str_to_str(p);
 
     let result = (|| -> crate::error::Result<serde_json::Value> {
         if path_str.is_empty() {
@@ -525,7 +567,7 @@ pub unsafe extern "C" fn soas_browse_directory(path: *const c_char) -> *mut c_ch
 
         // Obtener hashes de archivos indexados para marcar cuáles están indexados
         let (indexed_paths, indexed_metadata) = {
-            let state = SOAS.lock().unwrap();
+            let state = lock_soas()?;
             if let Some(ref s) = *state {
                 let paths: std::collections::HashSet<String> = s.storage
                     .get_all_file_paths_and_hashes()
@@ -623,53 +665,59 @@ pub unsafe extern "C" fn soas_browse_directory(path: *const c_char) -> *mut c_ch
     })();
 
     result_to_c_string(result)
-}}
+    }})
+}
 
 /// Retorna el directorio home del usuario
 #[unsafe(no_mangle)]
 pub extern "C" fn soas_get_home_dir() -> *mut c_char {
-    let result: crate::error::Result<String> = {
-        let home = std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
-            .unwrap_or_else(|_| "/".to_string());
-        Ok(home)
-    };
-    result_to_c_string(result)
+    safe_ffi(|| {
+        let result: crate::error::Result<String> = {
+            let home = std::env::var("HOME")
+                .or_else(|_| std::env::var("USERPROFILE"))
+                .unwrap_or_else(|_| "/".to_string());
+            Ok(home)
+        };
+        result_to_c_string(result)
+    })
 }
 
 /// Retorna los directorios especiales del usuario (Documentos, Descargas, etc.)
 #[unsafe(no_mangle)]
 pub extern "C" fn soas_get_special_dirs() -> *mut c_char {
-    let result: crate::error::Result<serde_json::Value> = {
-        let home = std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
-            .unwrap_or_else(|_| "/".to_string());
+    safe_ffi(|| {
+        let result: crate::error::Result<serde_json::Value> = {
+            let home = std::env::var("HOME")
+                .or_else(|_| std::env::var("USERPROFILE"))
+                .unwrap_or_else(|_| "/".to_string());
 
-        let candidates = [
-            ("home", home.clone()),
-            ("documents", format!("{}/Documents", home)),
-            ("downloads", format!("{}/Downloads", home)),
-            ("desktop", format!("{}/Desktop", home)),
-            ("pictures", format!("{}/Pictures", home)),
-            ("videos", format!("{}/Videos", home)),
-            ("music", format!("{}/Music", home)),
-        ];
+            let sep = if cfg!(windows) { "\\" } else { "/" };
+            let candidates = [
+                ("home", home.clone()),
+                ("documents", format!("{}{}{}", home, sep, "Documents")),
+                ("downloads", format!("{}{}{}", home, sep, "Downloads")),
+                ("desktop", format!("{}{}{}", home, sep, "Desktop")),
+                ("pictures", format!("{}{}{}", home, sep, "Pictures")),
+                ("videos", format!("{}{}{}", home, sep, "Videos")),
+                ("music", format!("{}{}{}", home, sep, "Music")),
+            ];
 
-        let dirs: serde_json::Value = candidates
-            .iter()
-            .filter_map(|(key, path)| {
-                if std::path::Path::new(path).is_dir() {
-                    Some(serde_json::json!({ "key": key, "path": path }))
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>()
-            .into();
+            let dirs: serde_json::Value = candidates
+                .iter()
+                .filter_map(|(key, path)| {
+                    if std::path::Path::new(path).is_dir() {
+                        Some(serde_json::json!({ "key": key, "path": path }))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .into();
 
-        Ok(dirs)
-    };
-    result_to_c_string(result)
+            Ok(dirs)
+        };
+        result_to_c_string(result)
+    })
 }
 
 /// Retorna información sobre una ruta (archivo o carpeta)
@@ -781,7 +829,7 @@ pub unsafe extern "C" fn soas_spotlight_search(
             return Ok(serde_json::json!({ "results": [], "query": query_str, "total": 0 }));
         }
 
-        let state = SOAS.lock().unwrap();
+        let state = lock_soas()?;
         let state = state
             .as_ref()
             .ok_or_else(|| crate::error::SoasError::Other("SOAS no inicializado".into()))?;
@@ -855,7 +903,7 @@ pub unsafe extern "C" fn soas_list_files(filter_json: *const c_char) -> *mut c_c
         let path_prefix = filter["path_prefix"].as_str();
         let sort_by = filter["sort_by"].as_str();
 
-        let state = SOAS.lock().unwrap();
+        let state = lock_soas()?;
         let state = state
             .as_ref()
             .ok_or_else(|| crate::error::SoasError::Other("SOAS no inicializado".into()))?;
@@ -886,7 +934,7 @@ pub unsafe extern "C" fn soas_get_file(file_id: *const c_char) -> *mut c_char { 
     let id = c_str_to_str(file_id);
 
     let result = (|| -> crate::error::Result<Option<crate::models::IndexedFile>> {
-        let state = SOAS.lock().unwrap();
+        let state = lock_soas()?;
         let state = state
             .as_ref()
             .ok_or_else(|| crate::error::SoasError::Other("SOAS no inicializado".into()))?;
@@ -912,7 +960,7 @@ pub unsafe extern "C" fn soas_get_files_in_path(
     let off = if offset < 0 { 0 } else { offset as usize };
 
     let result = (|| -> crate::error::Result<serde_json::Value> {
-        let state = SOAS.lock().unwrap();
+        let state = lock_soas()?;
         let state = state
             .as_ref()
             .ok_or_else(|| crate::error::SoasError::Other("SOAS no inicializado".into()))?;
@@ -941,7 +989,7 @@ pub extern "C" fn soas_get_recent_files(limit: i64) -> *mut c_char {
     let lim = if limit <= 0 { 20 } else { limit as usize };
 
     let result = (|| -> crate::error::Result<Vec<crate::models::IndexedFile>> {
-        let state = SOAS.lock().unwrap();
+        let state = lock_soas()?;
         let state = state
             .as_ref()
             .ok_or_else(|| crate::error::SoasError::Other("SOAS no inicializado".into()))?;
@@ -972,7 +1020,7 @@ pub unsafe extern "C" fn soas_get_files_by_extension(
         let exts: Vec<String> = serde_json::from_str(json_str).unwrap_or_default();
         let ext_refs: Vec<&str> = exts.iter().map(|s| s.as_str()).collect();
 
-        let state = SOAS.lock().unwrap();
+        let state = lock_soas()?;
         let state = state
             .as_ref()
             .ok_or_else(|| crate::error::SoasError::Other("SOAS no inicializado".into()))?;
@@ -992,7 +1040,7 @@ pub unsafe extern "C" fn soas_get_files_by_extension(
 #[unsafe(no_mangle)]
 pub extern "C" fn soas_get_distinct_extensions() -> *mut c_char {
     let result = (|| -> crate::error::Result<Vec<String>> {
-        let state = SOAS.lock().unwrap();
+        let state = lock_soas()?;
         let state = state
             .as_ref()
             .ok_or_else(|| crate::error::SoasError::Other("SOAS no inicializado".into()))?;
@@ -1086,7 +1134,7 @@ pub unsafe extern "C" fn soas_delete_file_from_index(file_id: *const c_char) -> 
     let id = c_str_to_str(file_id);
 
     let result = (|| -> crate::error::Result<bool> {
-        let mut state = SOAS.lock().unwrap();
+        let mut state = lock_soas()?;
         let state = state
             .as_mut()
             .ok_or_else(|| crate::error::SoasError::Other("SOAS no inicializado".into()))?;
@@ -1117,7 +1165,7 @@ pub unsafe extern "C" fn soas_update_folder(
     let result = (|| -> crate::error::Result<crate::models::WatchedFolder> {
         let patch: serde_json::Value = serde_json::from_str(json_str)?;
 
-        let state = SOAS.lock().unwrap();
+        let state = lock_soas()?;
         let state = state
             .as_ref()
             .ok_or_else(|| crate::error::SoasError::Other("SOAS no inicializado".into()))?;
@@ -1176,7 +1224,7 @@ pub unsafe extern "C" fn soas_reindex_file(path: *const c_char) -> *mut c_char {
             ));
         }
 
-        let mut state = SOAS.lock().unwrap();
+        let mut state = lock_soas()?;
         let state = state
             .as_mut()
             .ok_or_else(|| crate::error::SoasError::Other("SOAS no inicializado".into()))?;
@@ -1224,7 +1272,7 @@ pub unsafe extern "C" fn soas_scan_folder(folder_id: *const c_char) -> *mut c_ch
     let id = c_str_to_str(folder_id);
 
     let result = (|| -> crate::error::Result<serde_json::Value> {
-        let mut state = SOAS.lock().unwrap();
+        let mut state = lock_soas()?;
         let state = state
             .as_mut()
             .ok_or_else(|| crate::error::SoasError::Other("SOAS no inicializado".into()))?;
@@ -1253,6 +1301,49 @@ pub unsafe extern "C" fn soas_scan_folder(folder_id: *const c_char) -> *mut c_ch
             "updated_files": scan_result.updated_files,
             "deleted_files": scan_result.deleted_files,
             "failed_files": scan_result.failed_files,
+        }))
+    })();
+
+    result_to_c_string(result)
+}}
+
+/// Limpia completamente el índice de una carpeta: borra todos los archivos
+/// indexados bajo esa ruta y sus vectores del vector store.
+/// La carpeta monitoreada se mantiene, solo se borran los archivos indexados.
+/// Útil para forzar una reindexación desde cero.
+///
+/// # Safety
+/// `folder_path` debe ser un string C válido con la ruta absoluta de la carpeta
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn soas_clear_folder_index(folder_path: *const c_char) -> *mut c_char { unsafe {
+    let path_str = c_str_to_str(folder_path).to_string();
+
+    let result = (|| -> crate::error::Result<serde_json::Value> {
+        let mut state = lock_soas()?;
+        let state = state
+            .as_mut()
+            .ok_or_else(|| crate::error::SoasError::Other("SOAS no inicializado".into()))?;
+
+        // 1. Obtener IDs de todos los archivos bajo esta ruta
+        let file_ids = state.storage.get_file_ids_by_path_prefix(&path_str)?;
+        let count = file_ids.len();
+
+        // 2. Eliminar sus vectores del vector store
+        for id in &file_ids {
+            let _ = state.vector_store.remove(id);
+        }
+
+        // 3. Persistir el vector store inmediatamente
+        let _ = state.vector_store.save();
+
+        // 4. Borrar archivos de SQLite (los triggers FTS se encargan del FTS)
+        state.storage.delete_files_by_path_prefix(&path_str)?;
+
+        tracing::info!("soas_clear_folder_index: eliminados {} archivos bajo '{}'", count, path_str);
+
+        Ok(serde_json::json!({
+            "cleared_files": count,
+            "folder_path": path_str,
         }))
     })();
 

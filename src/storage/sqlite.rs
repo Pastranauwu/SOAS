@@ -357,6 +357,18 @@ impl SqliteStorage {
         Ok(())
     }
 
+    /// Obtiene los IDs de todos los archivos bajo un prefijo de ruta
+    /// Útil para eliminar sus vectores antes de borrarlos de SQLite
+    pub fn get_file_ids_by_path_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM indexed_files WHERE path LIKE ?1",
+        )?;
+        let ids = stmt
+            .query_map(params![format!("{}%", prefix)], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(ids)
+    }
+
     /// Elimina archivos cuya ruta comience con un prefijo (al quitar una carpeta)
     pub fn delete_files_by_path_prefix(&self, prefix: &str) -> Result<u64> {
         let count = self.conn.execute(

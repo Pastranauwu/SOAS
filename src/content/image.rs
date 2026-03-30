@@ -309,9 +309,14 @@ pub async fn extract(path: &Path, ollama: &OllamaClient) -> Result<ExtractedCont
     // - Pedir transcripción produce peores resultados que pedir descripción
     // - El nombre del archivo es MÁS confiable que el VLM para identificar docs
     // - El VLM solo aporta: clasificación visual + descripción de contenido
-    let summary_prompt = "Describe esta imagen en español en 2-3 oraciones. \
-        ¿Qué tipo de imagen es? ¿Qué muestra? \
-        Si parece un documento oficial, di de qué tipo parece ser.";
+    let summary_prompt = "Actúa como un experto en análisis visual forense. Describe esta imagen en detalle para un índice de búsqueda.
+REGLAS:
+1. Identifica el TIPO de imagen: (fotografía, captura de pantalla, documento escaneado, ilustración, gráfico).
+2. EXTRAE TEXTO VISIBLE: Si hay texto legible (nombres, fechas, títulos), inclúyelo textualmente.
+3. DETALLES VISUALES CLAVE: Describe objetos, personas, colores predominantes y contexto (lugar, evento).
+4. SI ES DOCUMENTO: Identifica el tipo exacto (INE, pasaporte, recibo, factura, contrato) y su propósito.
+5. Sé conciso pero denso en información útil para búsqueda.
+Responde en español, en un párrafo coherente de 3-4 oraciones.";
 
     // ── Retry con backoff para tolerancia a fallos transitorios ──────────
     // La primera imagen puede fallar por carga del modelo en RAM.
